@@ -1,0 +1,11 @@
+sources:
+- /root/shufangxun/data/splits/qwen3_1p7b_pretrain_smallval/val/fineweb_sample_10bt_100.parquet
+- /root/shufangxun/data/splits/qwen3_1p7b_pretrain_smallval/val/finewiki_en_100.parquet
+
+names:
+- fineweb_sample_10bt
+- finewiki_en
+
+schedule:
+- schedule_type: const
+  weights: [0.8, 0.2]

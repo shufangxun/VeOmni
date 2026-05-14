@@ -1,0 +1,15 @@
+sources:
+- /root/shufangxun/data/splits/qwen3_1p7b_pretrain_smallval/train/fineweb_sample_10bt
+- /root/shufangxun/data/splits/qwen3_1p7b_pretrain_smallval/train/finewiki_en
+
+names:
+- fineweb_sample_10bt
+- finewiki_en
+
+schedule:
+- schedule_type: const
+  weights: [0.8, 0.2]
+
+level: token
+stopping_strategy: never_exhausted
+upstream_sharded: true

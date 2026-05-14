@@ -85,6 +85,7 @@ def build_native_dataloader(
     build_collate_fn: bool = True,
     collate_fn_kwargs: Optional[Dict[str, Any]] = None,
     multiprocessing_context=None,
+    repeat_on_exhaustion: bool = True,
 ) -> "DistributedDataloader":
     """Build the native training dataloader.
 
@@ -227,6 +228,7 @@ def build_native_dataloader(
             num_micro_batch=num_micro_batch,
             length=train_steps,
             drop_last=drop_last,
+            repeat_on_exhaustion=repeat_on_exhaustion,
         )
 
     return dataloader

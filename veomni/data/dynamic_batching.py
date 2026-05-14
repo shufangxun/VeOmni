@@ -207,6 +207,7 @@ class DynamicBatchSizeDataLoader:
         num_micro_batch: int = 1,
         length: int = 0,
         drop_last: bool = True,
+        repeat_on_exhaustion: bool = True,
     ) -> None:
         self.batching_strategy = batching_strategy
         self.num_micro_batch = num_micro_batch
@@ -216,6 +217,7 @@ class DynamicBatchSizeDataLoader:
         self._collate_fn = collate_fn
         self._dataloader = dataloader
         self._drop_last = drop_last
+        self._repeat_on_exhaustion = repeat_on_exhaustion
         self._data_iter: Iterator
         self._resume = False
         self._batch_data_iter: Generator
@@ -265,7 +267,7 @@ class DynamicBatchSizeDataLoader:
                 processing_item = next(self._data_iter)
             except Exception as e:
                 if isinstance(e, StopIteration):
-                    if self.step < self._length:
+                    if self._repeat_on_exhaustion and self.step < self._length:
                         # call iter until reach length
                         self._data_iter = iter(self._dataloader)
                         processing_item = next(self._data_iter)

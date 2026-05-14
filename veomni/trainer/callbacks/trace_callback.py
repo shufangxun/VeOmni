@@ -206,6 +206,7 @@ class EnvironMeterCallback(Callback):
             step_train_metrics["training/lr"] = lr
 
         step_env_metrics.update(step_train_metrics)
+        step_env_metrics.update(getattr(self.trainer, "step_train_source_metrics", {}))
 
         self.trainer.step_train_metrics = step_train_metrics
         self.trainer.step_env_metrics = step_env_metrics

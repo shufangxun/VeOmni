@@ -520,8 +520,13 @@ class BaseTrainer(Stateful, ABC):
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         micro_batch = self.preforward(micro_batch)
 
+        model_kwargs = {}
+        if getattr(self, "return_train_source_log_probs", False):
+            model_kwargs["return_log_probs_with_loss"] = True
+
         with self.model_fwd_context, set_batch_invariant_mode(self.args.train.enable_batch_invariant_mode):
-            outputs: ModelOutput = self.model(**micro_batch, use_cache=False)
+            outputs: ModelOutput = self.model(**micro_batch, use_cache=False, **model_kwargs)
+        self.last_train_log_probs = getattr(outputs, "log_probs", None)
 
         loss: torch.Tensor
         loss_dict: Dict[str, torch.Tensor]

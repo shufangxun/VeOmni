@@ -96,6 +96,7 @@ def ForCausalLMLoss(
     # slots carry the per-token log-probabilities and softmax entropy back to
     # the caller.
     return_log_probs = kwargs.pop("return_log_probs", False)
+    return_log_probs_with_loss = kwargs.pop("return_log_probs_with_loss", False)
     # ``temperature`` is part of the PPO actor contract — verl divides logits
     # by it before log_softmax. Pop here so it does not propagate into the
     # plain loss path (where it would trip the inner CE kernel) and so the
@@ -121,6 +122,10 @@ def ForCausalLMLoss(
             temperature=temperature,
         )
         return None, None, log_probs, entropy
+
+    logprob_hidden_states = hidden_states
+    logprob_labels = labels
+    logprob_shift_labels = shift_labels
 
     device = logits.device if logits is not None else hidden_states.device
     # Upcast to float if we need to compute the loss to avoid potential precision issues
@@ -164,7 +169,24 @@ def ForCausalLMLoss(
     if sp_enabled:
         num_valid_tokens = (labels != ignore_index).sum()
         loss = reduce_sequence_parallel_loss(loss, num_valid_tokens)
-    return loss, logits, None, None
+    log_probs = None
+    entropy = None
+    if return_log_probs_with_loss:
+        if logprob_hidden_states is None:
+            raise ValueError("return_log_probs_with_loss=True requires hidden_states (fused-linear path).")
+        if weights is None:
+            raise ValueError("return_log_probs_with_loss=True requires weights (lm_head weight).")
+        with torch.no_grad():
+            log_probs, entropy = chunk_logprobs_function(
+                logprob_hidden_states,
+                weights,
+                logprob_labels,
+                ignore_index=ignore_index,
+                shift_labels=logprob_shift_labels,
+                temperature=temperature,
+            )
+
+    return loss, logits, log_probs, entropy
 
 
 def ForSequenceClassificationLoss(

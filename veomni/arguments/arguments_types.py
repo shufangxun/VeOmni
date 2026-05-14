@@ -392,6 +392,22 @@ class TrainingArguments:
         default=None,
         metadata={"help": "Global batch size. If None, use `micro_batch_size` * `data_parallel_size`."},
     )
+    eval_micro_batch_size: Optional[int] = field(
+        default=None,
+        metadata={"help": "Micro batch size for evaluation. If None, use `micro_batch_size`."},
+    )
+    eval_global_batch_size: Optional[int] = field(
+        default=None,
+        metadata={"help": "Global batch size for evaluation. If None, use `global_batch_size`."},
+    )
+    eval_dataloader_num_workers: Optional[int] = field(
+        default=None,
+        metadata={"help": "Number of dataloader workers for evaluation. If None, use data.dataloader.num_workers."},
+    )
+    log_train_source_loss_steps: int = field(
+        default=0,
+        metadata={"help": "Log exact token-weighted training loss/PPL per data source every N steps. 0 disables it."},
+    )
     num_train_epochs: int = field(
         default=1,
         metadata={"help": "Epochs to train."},
@@ -447,6 +463,12 @@ class TrainingArguments:
     eval_epochs: int = field(
         default=1,
         metadata={"help": "Number of epochs between two evaluations. 0 to disable."},
+    )
+    eval_max_steps: int = field(
+        default=0,
+        metadata={
+            "help": "Maximum number of validation steps per evaluation. 0 means evaluate the full validation set."
+        },
     )
     seed: int = field(
         default=42,
@@ -555,6 +577,22 @@ class TrainingArguments:
         else:
             raise ValueError(f"`global_batch_size` should be a multiple of {self.micro_batch_size * acc.dp_size}.")
 
+        if self.eval_micro_batch_size is None:
+            self.eval_micro_batch_size = self.micro_batch_size
+        if self.eval_global_batch_size is None:
+            self.eval_global_batch_size = self.global_batch_size
+
+        eval_micro_batch_size = self.eval_micro_batch_size
+        eval_global_batch_size = self.eval_global_batch_size
+        if eval_micro_batch_size <= 0:
+            raise ValueError("`eval_micro_batch_size` should be positive.")
+        if eval_global_batch_size % (eval_micro_batch_size * acc.dp_size) == 0:
+            self.eval_gradient_accumulation_steps = eval_global_batch_size // (eval_micro_batch_size * acc.dp_size)
+        else:
+            raise ValueError(
+                f"`eval_global_batch_size` should be a multiple of {eval_micro_batch_size * acc.dp_size}."
+            )
+
         if self.gradient_accumulation_steps > 1 and acc.fsdp_config.offload:
             raise ValueError("Gradient accumulation is not supported with FSDP offload.")
 
@@ -562,10 +600,13 @@ class TrainingArguments:
         if self.dyn_bsz:
             if self.dyn_bsz_runtime == "main":
                 self.dataloader_batch_size = 1
+                self.eval_dataloader_batch_size = 1
             else:
                 self.dataloader_batch_size = self.global_batch_size // acc.dp_size // self.micro_batch_size
+                self.eval_dataloader_batch_size = eval_global_batch_size // acc.dp_size // eval_micro_batch_size
         else:
             self.dataloader_batch_size = self.global_batch_size // acc.dp_size  # = micro bsz * grad accu
+            self.eval_dataloader_batch_size = eval_global_batch_size // acc.dp_size
 
     def _resolve_checkpoint_paths(self):
         ckpt = self.checkpoint
