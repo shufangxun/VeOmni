@@ -1,8 +1,9 @@
 model:
-  config_path: Qwen/Qwen3-1.7B-Base
-  tokenizer_path: Qwen/Qwen3-1.7B-Base
+  config_path: Qwen/Qwen3-30B-A3B
+  tokenizer_path: Qwen/Qwen3-30B-A3B
   ops_implementation:
     attn_implementation: flash_attention_2
+    moe_implementation: fused_triton
 
 data:
   train_path: configs/text/data/fineweb_finewiki.yaml
@@ -22,13 +23,14 @@ data:
 train:
   accelerator:
     ulysses_size: 1
+    ep_size: 1
     fsdp_config:
       fsdp_mode: fsdp2
       full_shard: true
       offload: false
       mixed_precision:
         enable: true
-    offload:
+    offload_config:
       enable_activation: false
   gradient_checkpointing:
     enable: true
@@ -37,7 +39,7 @@ train:
   eval_global_batch_size: 16
   eval_micro_batch_size: 4
   eval_dataloader_num_workers: 1
-  log_train_source_loss_steps: 5 # log source loss
+  log_train_source_loss_steps: 5
   bsz_warmup_ratio: 0.007
   eval_steps: 5
   eval_epochs: 0
@@ -52,11 +54,11 @@ train:
   enable_full_determinism: false
   empty_cache_steps: 500
   checkpoint:
-    output_dir: exp/qwen3-1.7b-fineweb-finewiki-scratch
+    output_dir: exp/qwen3-30b-a3b-fineweb-finewiki-scratch-ep1
     manager: dcp
     save_steps: 100
     save_hf_weights: true
   wandb:
     enable: true
     project: qwen3-pretrain
-    name: Qwen3-1.7B-FineWeb-FineWiki-scratch
+    name: Qwen3-30B-A3B-FineWeb-FineWiki-scratch-ep1
