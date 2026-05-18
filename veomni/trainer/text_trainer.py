@@ -15,7 +15,7 @@
 import math
 import time
 from collections import defaultdict
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import torch
 
@@ -122,6 +122,11 @@ class TextTrainer:
             and self.base.state.global_step % interval == 0
         )
 
+    def _should_log_train_domain_loss(self) -> bool:
+        args: VeOmniArguments = self.base.args
+        interval = args.train.log_train_domain_loss_steps
+        return bool(interval and not get_parallel_state().sp_enabled and self.base.state.global_step % interval == 0)
+
     @staticmethod
     def _as_list(value: Any) -> List[Any]:
         if value is None:
@@ -137,17 +142,27 @@ class TextTrainer:
             return self.train_source_names[ds_idx]
         return f"source_{ds_idx}"
 
-    def _snapshot_train_source_metadata(self, micro_batches: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _snapshot_train_loss_metadata(
+        self,
+        micro_batches: List[Dict[str, Any]],
+        include_source: bool,
+        include_domain: bool,
+    ) -> List[Dict[str, Any]]:
         metadata = []
         for micro_batch in micro_batches:
-            ds_indices = [int(idx) for idx in self._as_list(micro_batch.get("ds_idx"))]
-            source_names = [str(name) for name in self._as_list(micro_batch.get("source_name"))]
-            if not source_names:
-                source_names = [self._source_name_from_idx(ds_idx) for ds_idx in ds_indices]
+            source_names = []
+            domain_names = []
+            if include_source:
+                ds_indices = [int(idx) for idx in self._as_list(micro_batch.get("ds_idx"))]
+                source_names = [str(name) for name in self._as_list(micro_batch.get("source_name"))]
+                if not source_names:
+                    source_names = [self._source_name_from_idx(ds_idx) for ds_idx in ds_indices]
+            if include_domain:
+                domain_names = [str(name) for name in self._as_list(micro_batch.get("domain_name"))]
 
             position_ids = micro_batch.get("position_ids")
             if position_ids is None:
-                metadata.append({"source_names": [], "segment_starts": []})
+                metadata.append({"source_names": [], "domain_names": [], "segment_starts": []})
                 continue
 
             position_ids = position_ids.detach().cpu()
@@ -158,63 +173,75 @@ class TextTrainer:
             if not segment_starts or segment_starts[0] != 0:
                 segment_starts = [0, *segment_starts]
 
-            if len(source_names) != len(segment_starts):
+            if include_source and len(source_names) != len(segment_starts):
                 logger.warning_once(
-                    "Skip training source loss for a micro batch because source metadata does not match packed segments: "
+                    "Skip training source loss for a micro batch because source metadata does not match packed "
+                    "segments: "
                     f"num_sources={len(source_names)}, num_segments={len(segment_starts)}."
                 )
                 source_names = []
-                segment_starts = []
+            if include_domain and len(domain_names) != len(segment_starts):
+                logger.warning_once(
+                    "Skip training domain loss for a micro batch because domain metadata does not match packed "
+                    f"segments: num_domains={len(domain_names)}, num_segments={len(segment_starts)}."
+                )
+                domain_names = []
 
-            metadata.append({"source_names": source_names, "segment_starts": segment_starts})
+            metadata.append(
+                {"source_names": source_names, "domain_names": domain_names, "segment_starts": segment_starts}
+            )
         return metadata
 
-    def _accumulate_train_source_loss(
+    def _accumulate_train_group_loss(
         self,
-        source_stats: Dict[str, Dict[str, float]],
+        group_stats: Dict[str, Dict[str, float]],
         micro_batch_metadata: Dict[str, Any],
+        group_key: str,
         log_probs: torch.Tensor,
     ) -> None:
-        source_names = micro_batch_metadata["source_names"]
+        group_names = micro_batch_metadata[group_key]
         segment_starts = micro_batch_metadata["segment_starts"]
-        if not source_names or log_probs is None:
+        if not group_names or log_probs is None:
             return
 
         log_probs = log_probs.detach().float().reshape(-1)
         seq_len = log_probs.numel()
         segment_ends = [*segment_starts[1:], seq_len]
 
-        for source_name, start, end in zip(source_names, segment_starts, segment_ends):
+        for group_name, start, end in zip(group_names, segment_starts, segment_ends):
             end = min(end, log_probs.numel())
             if end <= start:
                 continue
 
-            source_log_probs = log_probs[start:end]
-            valid_mask = source_log_probs != 0
+            group_log_probs = log_probs[start:end]
+            valid_mask = group_log_probs != 0
             token_count = int(valid_mask.sum().item())
             if token_count == 0:
                 continue
 
-            item = source_stats[source_name]
-            item["loss_sum"] += float((-source_log_probs[valid_mask]).sum().item())
+            item = group_stats[group_name]
+            item["loss_sum"] += float((-group_log_probs[valid_mask]).sum().item())
             item["tokens"] += token_count
 
     @staticmethod
-    def _metric_source_name(source_name: str) -> str:
-        return source_name.replace("/", "_")
+    def _metric_group_name(group_name: str) -> str:
+        return group_name.replace("/", "_")
 
-    def _build_train_source_metrics(
+    def _build_train_group_metrics(
         self,
-        source_stats: Dict[str, Dict[str, float]],
+        group_stats: Dict[str, Dict[str, float]],
         aggregation_time: float,
+        metric_prefix: str,
+        aggregation_metric_name: str,
+        ordered_group_names: Optional[List[str]] = None,
     ) -> Dict[str, float]:
         metrics = {}
-        source_names = list(self.train_source_names)
-        for source_name in sorted(set(source_stats.keys()) - set(source_names)):
-            source_names.append(source_name)
+        group_names = list(ordered_group_names or [])
+        for group_name in sorted(set(group_stats.keys()) - set(group_names)):
+            group_names.append(group_name)
 
-        for source_name in source_names:
-            local_stats = source_stats.get(source_name, {})
+        for group_name in group_names:
+            local_stats = group_stats.get(group_name, {})
             loss_sum = float(local_stats.get("loss_sum", 0.0))
             tokens = float(local_stats.get("tokens", 0.0))
             global_loss_sum, global_tokens = all_reduce(
@@ -224,13 +251,13 @@ class TextTrainer:
                 continue
 
             loss = global_loss_sum / global_tokens
-            metric_name = self._metric_source_name(source_name)
-            metrics[f"training/source/{metric_name}/loss"] = loss
-            metrics[f"training/source/{metric_name}/ppl"] = math.exp(loss) if loss < 100 else float("inf")
-            metrics[f"training/source/{metric_name}/tokens"] = global_tokens
+            metric_name = self._metric_group_name(group_name)
+            metrics[f"{metric_prefix}/{metric_name}/loss"] = loss
+            metrics[f"{metric_prefix}/{metric_name}/ppl"] = math.exp(loss) if loss < 100 else float("inf")
+            metrics[f"{metric_prefix}/{metric_name}/tokens"] = global_tokens
 
         max_aggregation_time = all_reduce(aggregation_time, op="max", group=get_parallel_state().dp_group)
-        metrics["training/source_loss/aggregation_time_ms"] = max_aggregation_time * 1000
+        metrics[aggregation_metric_name] = max_aggregation_time * 1000
         return metrics
 
     def train_step(
@@ -242,9 +269,21 @@ class TextTrainer:
 
         micro_batches: List[Dict[str, Any]] = next(data_iterator)
         log_train_source_loss = self._should_log_train_source_loss()
-        train_source_metadata = self._snapshot_train_source_metadata(micro_batches) if log_train_source_loss else None
+        log_train_domain_loss = self._should_log_train_domain_loss()
+        log_train_group_loss = log_train_source_loss or log_train_domain_loss
+        train_loss_metadata = (
+            self._snapshot_train_loss_metadata(
+                micro_batches,
+                include_source=log_train_source_loss,
+                include_domain=log_train_domain_loss,
+            )
+            if log_train_group_loss
+            else None
+        )
         train_source_stats: Dict[str, Dict[str, float]] = defaultdict(lambda: {"loss_sum": 0.0, "tokens": 0.0})
+        train_domain_stats: Dict[str, Dict[str, float]] = defaultdict(lambda: {"loss_sum": 0.0, "tokens": 0.0})
         train_source_aggregation_time = 0.0
+        train_domain_aggregation_time = 0.0
 
         self.on_step_begin(micro_batches=micro_batches)
 
@@ -264,18 +303,28 @@ class TextTrainer:
             loss_dict: Dict[str, torch.Tensor]
             # token num for fixed_ce_loss in postforward
             self.base.micro_batch_token_len = count_loss_token(micro_batch)
-            self.base.return_train_source_log_probs = log_train_source_loss
+            self.base.return_train_source_log_probs = log_train_group_loss
             loss, loss_dict = self.base.forward_backward_step(micro_batch)
             self.base.return_train_source_log_probs = False
 
             if log_train_source_loss:
                 start_time = time.perf_counter()
-                self._accumulate_train_source_loss(
+                self._accumulate_train_group_loss(
                     train_source_stats,
-                    train_source_metadata[micro_step],
+                    train_loss_metadata[micro_step],
+                    "source_names",
                     self.base.last_train_log_probs,
                 )
                 train_source_aggregation_time += time.perf_counter() - start_time
+            if log_train_domain_loss:
+                start_time = time.perf_counter()
+                self._accumulate_train_group_loss(
+                    train_domain_stats,
+                    train_loss_metadata[micro_step],
+                    "domain_names",
+                    self.base.last_train_log_probs,
+                )
+                train_domain_aggregation_time += time.perf_counter() - start_time
 
             total_loss += loss.item()
             for k, v in loss_dict.items():
@@ -290,10 +339,25 @@ class TextTrainer:
         self.base.optimizer.zero_grad()
 
         self.base.step_train_source_metrics = (
-            self._build_train_source_metrics(train_source_stats, train_source_aggregation_time)
+            self._build_train_group_metrics(
+                train_source_stats,
+                train_source_aggregation_time,
+                "training/source",
+                "training/source_loss/aggregation_time_ms",
+                ordered_group_names=list(self.train_source_names),
+            )
             if log_train_source_loss
             else {}
         )
+        if log_train_domain_loss:
+            self.base.step_train_source_metrics.update(
+                self._build_train_group_metrics(
+                    train_domain_stats,
+                    train_domain_aggregation_time,
+                    "training/domain",
+                    "training/domain_loss/aggregation_time_ms",
+                )
+            )
         self.on_step_end(loss=total_loss, loss_dict=total_loss_dict, grad_norm=grad_norm)
 
     def train(self):

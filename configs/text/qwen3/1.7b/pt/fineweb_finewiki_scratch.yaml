@@ -38,6 +38,7 @@ train:
   eval_micro_batch_size: 4
   eval_dataloader_num_workers: 1
   log_train_source_loss_steps: 5
+  log_train_domain_loss_steps: 5
   bsz_warmup_ratio: 0.007
   eval_steps: 5
   eval_epochs: 0
@@ -54,8 +55,8 @@ train:
   checkpoint:
     output_dir: exp/qwen3-1.7b-fineweb-finewiki-scratch
     manager: dcp
-    save_steps: 100
-    save_hf_weights: true
+    save_steps: 0
+    save_hf_weights: false
   wandb:
     enable: true
     project: qwen3-pretrain

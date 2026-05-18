@@ -1,6 +1,6 @@
 sources:
-- /root/shufangxun/data/splits/qwen3_1p7b_pretrain_smallval/val/fineweb_sample_10bt_100.parquet
-- /root/shufangxun/data/splits/qwen3_1p7b_pretrain_smallval/val/finewiki_en_100.parquet
+- /root/shufangxun/data/splits/qwen3_1p7b_pretrain_smallval_domain/val/fineweb_sample_10bt_100.parquet
+- /root/shufangxun/data/splits/qwen3_1p7b_pretrain_smallval_domain/val/finewiki_en_100.parquet
 
 names:
 - fineweb_sample_10bt

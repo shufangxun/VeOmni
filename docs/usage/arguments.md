@@ -224,6 +224,8 @@ NPU validation runs at two times:
 | gc_steps | `int` | `500` | Steps between two `gc.collect()` calls. Disabled if positive. |
 | eval_steps | `int` | `0` | Steps between evaluations. `0` to disable. |
 | eval_epochs | `int` | `1` | Epochs between evaluations. `0` to disable. |
+| log_train_source_loss_steps | `int` | `0` | Log exact token-weighted training loss/PPL per data source every N steps. `0` disables it. |
+| log_train_domain_loss_steps | `int` | `0` | Log exact token-weighted training loss/PPL per data domain every N steps. `0` disables it. |
 | seed | `int` | `42` | Random seed. |
 | enable_compile | `bool` | `False` | Enable `torch.compile`. |
 | max_steps | `Optional[int]` | `None` | Max training steps per epoch (debug only). |

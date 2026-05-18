@@ -51,6 +51,29 @@ def test_seqcls_collator_sp_disabled(monkeypatch, features_two_samples):
     assert out["max_length_k"] == exp_max_length
 
 
+def test_collator_keeps_domain_metadata_per_packed_segment(monkeypatch, features_two_samples):
+    import veomni.data.data_collator as m
+
+    monkeypatch.setattr(m, "get_parallel_state", lambda: _fake_ps(sp_enabled=False))
+    token_labels = [
+        {
+            **features_two_samples[0],
+            "labels": torch.tensor([11, 12, 13], dtype=torch.long),
+            "domain_name": "web",
+        },
+        {
+            **features_two_samples[1],
+            "labels": torch.tensor([21, 22], dtype=torch.long),
+            "domain_name": "knowledge",
+        },
+    ]
+    collator = m.MainCollator()
+    out = collator(token_labels)
+
+    assert out["domain_name"] == ["web", "knowledge"]
+    assert torch.equal(out["position_ids"], torch.tensor([[0, 1, 2, 0, 1]], dtype=torch.long))
+
+
 def test_seqcls_collator_sp_enabled(monkeypatch, features_two_samples):
     import veomni.data.data_collator as m
 

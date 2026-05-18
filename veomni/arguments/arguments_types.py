@@ -408,6 +408,10 @@ class TrainingArguments:
         default=0,
         metadata={"help": "Log exact token-weighted training loss/PPL per data source every N steps. 0 disables it."},
     )
+    log_train_domain_loss_steps: int = field(
+        default=0,
+        metadata={"help": "Log exact token-weighted training loss/PPL per data domain every N steps. 0 disables it."},
+    )
     num_train_epochs: int = field(
         default=1,
         metadata={"help": "Epochs to train."},

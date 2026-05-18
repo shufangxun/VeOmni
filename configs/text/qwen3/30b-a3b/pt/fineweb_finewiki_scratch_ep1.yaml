@@ -40,6 +40,7 @@ train:
   eval_micro_batch_size: 4
   eval_dataloader_num_workers: 1
   log_train_source_loss_steps: 5
+  log_train_domain_loss_steps: 5
   bsz_warmup_ratio: 0.007
   eval_steps: 5
   eval_epochs: 0

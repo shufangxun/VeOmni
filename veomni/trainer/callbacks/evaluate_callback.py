@@ -138,24 +138,100 @@ class EvaluateCallback(Callback):
         micro_batch.pop("padding_flag", None)
         micro_batch.pop("ds_idx", None)
         micro_batch.pop("source_name", None)
+        micro_batch.pop("domain_name", None)
+        micro_batch.pop("domain", None)
         micro_batch.pop("cur_token_num", None)
         return self.trainer.preforward(micro_batch)
 
-    def _forward_eval_micro_batch(self, micro_batch: Dict[str, Any]) -> tuple[float, Dict[str, float]]:
+    @staticmethod
+    def _as_list(value: Any) -> list[Any]:
+        if value is None:
+            return []
+        if isinstance(value, torch.Tensor):
+            return value.detach().cpu().view(-1).tolist()
+        if isinstance(value, (list, tuple)):
+            return list(value)
+        return [value]
+
+    def _snapshot_domain_metadata(self, micro_batch: Dict[str, Any]) -> Dict[str, Any]:
+        from veomni.distributed.parallel_state import get_parallel_state
+
+        if get_parallel_state().sp_enabled:
+            return {"domain_names": [], "segment_starts": []}
+
+        domain_names = [str(name) for name in self._as_list(micro_batch.get("domain_name"))]
+        position_ids = micro_batch.get("position_ids")
+        if not domain_names or position_ids is None:
+            return {"domain_names": [], "segment_starts": []}
+
+        position_ids = position_ids.detach().cpu()
+        if position_ids.dim() == 3:
+            position_ids = position_ids[:, 0, :]
+        position_ids = position_ids.reshape(-1)
+        segment_starts = (position_ids == 0).nonzero(as_tuple=False).view(-1).tolist()
+        if not segment_starts or segment_starts[0] != 0:
+            segment_starts = [0, *segment_starts]
+
+        if len(domain_names) != len(segment_starts):
+            logger.warning_once(
+                "Skip eval domain loss for a micro batch because domain metadata does not match packed "
+                f"segments: num_domains={len(domain_names)}, num_segments={len(segment_starts)}."
+            )
+            return {"domain_names": [], "segment_starts": []}
+
+        return {"domain_names": domain_names, "segment_starts": segment_starts}
+
+    def _accumulate_eval_domain_loss(
+        self,
+        domain_stats: Dict[str, Dict[str, float]],
+        domain_metadata: Dict[str, Any],
+        log_probs: torch.Tensor,
+    ) -> None:
+        domain_names = domain_metadata["domain_names"]
+        segment_starts = domain_metadata["segment_starts"]
+        if not domain_names or log_probs is None:
+            return
+
+        log_probs = log_probs.detach().float().reshape(-1)
+        segment_ends = [*segment_starts[1:], log_probs.numel()]
+        for domain_name, start, end in zip(domain_names, segment_starts, segment_ends):
+            end = min(end, log_probs.numel())
+            if end <= start:
+                continue
+
+            domain_log_probs = log_probs[start:end]
+            valid_mask = domain_log_probs != 0
+            token_count = int(valid_mask.sum().item())
+            if token_count == 0:
+                continue
+
+            item = domain_stats[domain_name]
+            item["loss_sum"] += float((-domain_log_probs[valid_mask]).sum().item())
+            item["tokens"] += token_count
+
+    def _forward_eval_micro_batch(
+        self, micro_batch: Dict[str, Any]
+    ) -> tuple[float, Dict[str, float], Dict[str, Dict[str, float]]]:
         from veomni.ops.batch_invariant_ops import set_batch_invariant_mode
         from veomni.utils.loss_utils import count_loss_token
 
         self.trainer.micro_batch_token_len = count_loss_token(micro_batch)
+        domain_metadata = self._snapshot_domain_metadata(micro_batch)
         micro_batch = self._prepare_micro_batch(micro_batch)
+        model_kwargs = {}
+        if domain_metadata["domain_names"]:
+            model_kwargs["return_log_probs_with_loss"] = True
 
         with (
             self.trainer.model_fwd_context,
             set_batch_invariant_mode(self.trainer.args.train.enable_batch_invariant_mode),
         ):
-            outputs = self.trainer.model(**micro_batch, use_cache=False)
+            outputs = self.trainer.model(**micro_batch, use_cache=False, **model_kwargs)
 
         loss, loss_dict = self.trainer.postforward(outputs, micro_batch)
-        return loss.item(), {k: v.item() for k, v in loss_dict.items()}
+        domain_stats: Dict[str, Dict[str, float]] = defaultdict(lambda: {"loss_sum": 0.0, "tokens": 0.0})
+        self._accumulate_eval_domain_loss(domain_stats, domain_metadata, getattr(outputs, "log_probs", None))
+        return loss.item(), {k: v.item() for k, v in loss_dict.items()}, domain_stats
 
     def _evaluate_dataloader(self, dataloader) -> Dict[str, Any]:
         from veomni.distributed.parallel_state import get_parallel_state
@@ -168,6 +244,7 @@ class EvaluateCallback(Callback):
         dropped_tokens = 0.0
         dropped_rank_batches = 0.0
         eval_steps = 0
+        domain_stats: Dict[str, Dict[str, float]] = defaultdict(lambda: {"loss_sum": 0.0, "tokens": 0.0})
 
         data_iterator = iter(dataloader)
 
@@ -204,10 +281,13 @@ class EvaluateCallback(Callback):
             step_loss_dict: Dict[str, float] = defaultdict(float)
 
             for micro_batch in micro_batches:
-                loss, loss_dict = self._forward_eval_micro_batch(micro_batch)
+                loss, loss_dict, micro_batch_domain_stats = self._forward_eval_micro_batch(micro_batch)
                 step_loss += loss
                 for key, value in loss_dict.items():
                     step_loss_dict[key] += value
+                for domain_name, item in micro_batch_domain_stats.items():
+                    domain_stats[domain_name]["loss_sum"] += item["loss_sum"]
+                    domain_stats[domain_name]["tokens"] += item["tokens"]
 
             step_loss = all_reduce(step_loss, group=get_parallel_state().fsdp_group)
             step_loss_dict = {
@@ -227,6 +307,7 @@ class EvaluateCallback(Callback):
             "dropped_tokens": dropped_tokens,
             "dropped_rank_batches": dropped_rank_batches,
             "eval_steps": eval_steps,
+            "domain_stats": domain_stats,
         }
 
     def _build_metrics(self, stats: Dict[str, Any], prefix: str) -> Dict[str, float]:
@@ -241,6 +322,33 @@ class EvaluateCallback(Callback):
         metrics[f"{prefix}/dropped_tokens"] = stats["dropped_tokens"]
         metrics[f"{prefix}/dropped_rank_batches"] = stats["dropped_rank_batches"]
         metrics[f"{prefix}/steps"] = stats["eval_steps"]
+        return metrics
+
+    def _build_domain_metrics(self, domain_stats: Dict[str, Dict[str, float]]) -> Dict[str, float]:
+        from veomni.distributed.parallel_state import get_parallel_state
+        from torch import distributed as dist
+
+        metrics = {}
+        parallel_state = get_parallel_state()
+        domain_names = sorted(domain_stats.keys())
+        if dist.is_initialized():
+            gathered_domain_names = [None for _ in range(dist.get_world_size(group=parallel_state.dp_group))]
+            dist.all_gather_object(gathered_domain_names, domain_names, group=parallel_state.dp_group)
+            domain_names = sorted({name for names in gathered_domain_names for name in names})
+
+        for domain_name in domain_names:
+            local_stats = domain_stats[domain_name]
+            loss_sum = float(local_stats.get("loss_sum", 0.0))
+            tokens = float(local_stats.get("tokens", 0.0))
+            global_loss_sum, global_tokens = all_reduce((loss_sum, tokens), op="sum", group=parallel_state.dp_group)
+            if global_tokens == 0:
+                continue
+
+            loss = global_loss_sum / global_tokens
+            metric_name = self._metric_source_name(domain_name)
+            metrics[f"eval/domain/{metric_name}/loss"] = loss
+            metrics[f"eval/domain/{metric_name}/ppl"] = math.exp(loss) if loss < 100 else float("inf")
+            metrics[f"eval/domain/{metric_name}/tokens"] = global_tokens
         return metrics
 
     @staticmethod
@@ -280,6 +388,7 @@ class EvaluateCallback(Callback):
             "dropped_rank_batches": 0.0,
             "eval_steps": 0,
         }
+        total_domain_stats: Dict[str, Dict[str, float]] = defaultdict(lambda: {"loss_sum": 0.0, "tokens": 0.0})
 
         try:
             with torch.no_grad():
@@ -298,6 +407,9 @@ class EvaluateCallback(Callback):
                     total_stats["dropped_tokens"] += source_stats["dropped_tokens"]
                     total_stats["dropped_rank_batches"] += source_stats["dropped_rank_batches"]
                     total_stats["eval_steps"] += source_stats["eval_steps"]
+                    for domain_name, item in source_stats["domain_stats"].items():
+                        total_domain_stats[domain_name]["loss_sum"] += item["loss_sum"]
+                        total_domain_stats[domain_name]["tokens"] += item["tokens"]
         finally:
             if was_training:
                 self.trainer.model.train()
@@ -308,6 +420,7 @@ class EvaluateCallback(Callback):
             return
 
         metrics = {**self._build_metrics(total_stats, "eval"), **metrics}
+        metrics.update(self._build_domain_metrics(total_domain_stats))
 
         logger.info_rank0(
             "Validation metrics at step "

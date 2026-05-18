@@ -57,8 +57,9 @@ def process_plaintext_example(
     max_seq_len: int,
     text_keys: Union[str, List[str]] = "content_split",
     **kwargs,
-) -> List[Dict[str, "torch.Tensor"]]:
+) -> List[Dict[str, Any]]:
     examples = []
+    domain_name = example.get("domain_name", example.get("domain"))
     if isinstance(text_keys, str):
         text_example = example[text_keys]
     elif isinstance(text_keys, list):
@@ -73,13 +74,14 @@ def process_plaintext_example(
 
     tokens = tokenizer.encode(text_example, add_special_tokens=False) + [tokenizer.eos_token_id]
     for input_ids in split_into_chunks(tokens, max_seq_len):
-        examples.append(
-            {
-                "input_ids": torch.tensor(input_ids),
-                "attention_mask": torch.tensor([1] * len(input_ids)),
-                "labels": torch.tensor(input_ids),
-            }
-        )
+        processed_example = {
+            "input_ids": torch.tensor(input_ids),
+            "attention_mask": torch.tensor([1] * len(input_ids)),
+            "labels": torch.tensor(input_ids),
+        }
+        if domain_name is not None:
+            processed_example["domain_name"] = str(domain_name)
+        examples.append(processed_example)
 
     return examples
 

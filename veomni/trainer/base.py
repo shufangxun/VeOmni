@@ -496,6 +496,8 @@ class BaseTrainer(Stateful, ABC):
 
     def preforward(self, micro_batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Preprocess micro batches before forward pass."""
+        micro_batch.pop("domain_name", None)
+        micro_batch.pop("domain", None)
         micro_batch = {
             k: v.to(self.device, non_blocking=True) if isinstance(v, torch.Tensor) else v
             for k, v in micro_batch.items()
