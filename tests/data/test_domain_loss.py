@@ -4,9 +4,10 @@ from collections import defaultdict
 import pytest
 import torch
 
+
 pytest.importorskip("transformers")
 
-from veomni.data.data_transform import process_plaintext_example  # noqa: E402
+from veomni.data.data_transform import process_conversation_example, process_plaintext_example  # noqa: E402
 from veomni.trainer import text_trainer as text_trainer_module  # noqa: E402
 from veomni.trainer.callbacks.evaluate_callback import EvaluateCallback  # noqa: E402
 from veomni.trainer.text_trainer import TextTrainer  # noqa: E402
@@ -18,6 +19,17 @@ class DummyTokenizer:
     def encode(self, text, add_special_tokens=False):
         del add_special_tokens
         return list(range(1, len(text.split()) + 1))
+
+
+class DummyChatTemplate:
+    def encode_messages(self, messages, max_seq_len):
+        del messages
+        input_ids = list(range(1, max_seq_len + 1))
+        return {
+            "input_ids": input_ids,
+            "attention_mask": [1] * len(input_ids),
+            "labels": input_ids,
+        }
 
 
 def _trainer() -> TextTrainer:
@@ -51,6 +63,29 @@ def test_plaintext_transform_omits_missing_domain():
     )
 
     assert "domain_name" not in examples[0]
+
+
+def test_conversation_transform_copies_domain_metadata():
+    examples = process_conversation_example(
+        {"messages": [{"role": "user", "content": "hello"}], "domain": "sft"},
+        chat_template=DummyChatTemplate(),
+        max_seq_len=3,
+        text_keys="messages",
+    )
+
+    assert examples[0]["domain_name"] == "sft"
+    assert examples[0]["input_ids"].tolist() == [1, 2, 3]
+
+
+def test_conversation_transform_prefers_domain_name():
+    examples = process_conversation_example(
+        {"messages": [], "domain": "fallback", "domain_name": "correct"},
+        chat_template=DummyChatTemplate(),
+        max_seq_len=2,
+        text_keys="messages",
+    )
+
+    assert examples[0]["domain_name"] == "correct"
 
 
 def test_text_trainer_accumulates_domain_loss(monkeypatch):

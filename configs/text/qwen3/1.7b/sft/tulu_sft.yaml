@@ -1,0 +1,64 @@
+model:
+  model_path: Qwen/Qwen3-1.7B-Base
+  ops_implementation:
+    attn_implementation: flash_attention_2
+
+data:
+  train_path: configs/text/data/tulu_sft.yaml
+  eval_path: configs/text/data/tulu_sft_val.yaml
+  multisource_datasets_type: veomni_weighted_multisource
+  data_type: conversation
+  chat_template: chatml
+  datasets_type: iterable
+  max_seq_len: 4096
+  train_size: 750000000
+  text_keys: messages
+  dyn_bsz_buffer_size: 200
+  dataloader:
+    type: native
+    drop_last: true
+    num_workers: 1
+
+train:
+  accelerator:
+    ulysses_size: 1
+    fsdp_config:
+      fsdp_mode: fsdp2
+      full_shard: true
+      offload: false
+      mixed_precision:
+        enable: true
+    offload_config:
+      enable_activation: false
+  gradient_checkpointing:
+    enable: true
+  global_batch_size: 32
+  micro_batch_size: 1
+  eval_global_batch_size: 16
+  eval_micro_batch_size: 4
+  eval_dataloader_num_workers: 1
+  log_train_source_loss_steps: 5
+  log_train_domain_loss_steps: 5
+  bsz_warmup_ratio: 0.007
+  eval_steps: 5
+  eval_epochs: 0
+  optimizer:
+    type: adamw
+    lr: 1.0e-4
+    lr_warmup_ratio: 0.007
+    lr_decay_style: cosine
+    weight_decay: 0.01
+    max_grad_norm: 1.0
+  num_train_epochs: 1
+  init_device: meta
+  enable_full_determinism: false
+  empty_cache_steps: 500
+  checkpoint:
+    output_dir: exp/qwen3-1.7b-tulu-sft
+    manager: dcp
+    save_steps: 0
+    save_hf_weights: false
+  wandb:
+    enable: true
+    project: qwen3-sft
+    name: Qwen3-1.7B-Tulu-SFT

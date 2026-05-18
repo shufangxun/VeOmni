@@ -1,0 +1,13 @@
+sources:
+- /root/shufangxun/data/sft/text/tulu-3-sft-mixture/train
+
+names:
+- tulu_sft
+
+schedule:
+- schedule_type: const
+  weights: [1.0]
+
+level: token
+stopping_strategy: never_exhausted
+upstream_sharded: true

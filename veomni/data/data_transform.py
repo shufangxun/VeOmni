@@ -94,6 +94,7 @@ def process_conversation_example(
     text_keys: Union[str, List[str]] = "messages",
     **kwargs,
 ) -> List[Dict[str, "torch.Tensor"]]:
+    domain_name = example.get("domain_name", example.get("domain"))
     if isinstance(text_keys, str):
         text_example = example[text_keys]
     elif isinstance(text_keys, list):
@@ -108,6 +109,8 @@ def process_conversation_example(
 
     tokenized_example = chat_template.encode_messages(text_example, max_seq_len=max_seq_len)
     tokenized_example = {k: torch.tensor(v) for k, v in tokenized_example.items()}
+    if domain_name is not None:
+        tokenized_example["domain_name"] = str(domain_name)
     return [tokenized_example]
 
 
