@@ -16,6 +16,7 @@ import math
 from collections import defaultdict
 from collections.abc import Mapping
 from dataclasses import asdict
+from functools import partial
 from typing import TYPE_CHECKING, Any, Dict
 
 import torch
@@ -57,18 +58,33 @@ class EvaluateCallback(Callback):
         logger.info_rank0(f"Building validation dataset from {eval_path}.")
         if eval_path.endswith(".yaml"):
             eval_config = parse_multisource_config(eval_path)
-            eval_datasets = [
-                build_dataset(
-                    dataset_name=args.data.datasets_type,
-                    train_path=source,
-                    transform=self.trainer.data_transform,
-                    seed=args.train.seed,
-                    shuffle=False,
-                    source_name=source_name,
-                    **data_kwargs,
+            eval_datasets = []
+            eval_preprocesses = eval_config.get("preprocess")
+            eval_text_keys = eval_config.get("text_keys")
+            for idx, (source, source_name) in enumerate(zip(eval_config["sources"], eval_config["names"])):
+                source_transform = self.trainer.data_transform
+                source_dataset_kwargs = {}
+                if eval_preprocesses is not None or eval_text_keys is not None:
+                    source_transform_kwargs = {"ds_idx": idx, "source_name": source_name}
+                    if eval_preprocesses is not None:
+                        source_transform_kwargs["preprocess"] = eval_preprocesses[idx]
+                    if eval_text_keys is not None:
+                        source_transform_kwargs["text_keys"] = eval_text_keys[idx]
+                    source_transform = partial(self.trainer.data_transform, **source_transform_kwargs)
+                else:
+                    source_dataset_kwargs["source_name"] = source_name
+
+                eval_datasets.append(
+                    build_dataset(
+                        dataset_name=args.data.datasets_type,
+                        train_path=source,
+                        transform=source_transform,
+                        seed=args.train.seed,
+                        shuffle=False,
+                        **source_dataset_kwargs,
+                        **data_kwargs,
+                    )
                 )
-                for source, source_name in zip(eval_config["sources"], eval_config["names"])
-            ]
             eval_source_names = list(eval_config["names"])
         else:
             eval_datasets = [
@@ -325,8 +341,9 @@ class EvaluateCallback(Callback):
         return metrics
 
     def _build_domain_metrics(self, domain_stats: Dict[str, Dict[str, float]]) -> Dict[str, float]:
-        from veomni.distributed.parallel_state import get_parallel_state
         from torch import distributed as dist
+
+        from veomni.distributed.parallel_state import get_parallel_state
 
         metrics = {}
         parallel_state = get_parallel_state()

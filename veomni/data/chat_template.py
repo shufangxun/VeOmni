@@ -261,3 +261,20 @@ class ChatmlTemplate(ChatTemplate):
             "{% endfor %}"
             "{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}{% endif %}"
         )
+
+
+@CHAT_TEMPLATE_REGISTRY.register("mixed_chatml")
+class MixedChatmlTemplate(ChatmlTemplate):
+    def encode_pretrain_text(self, content: str, max_seq_len: int = 8192) -> List[Dict[str, List[int]]]:
+        input_ids = self.tokenizer.encode(content.strip(), add_special_tokens=False) + [self.tokenizer.eos_token_id]
+        examples = []
+        for start in range(0, len(input_ids), max_seq_len):
+            chunk = input_ids[start : start + max_seq_len]
+            examples.append(
+                {
+                    "input_ids": chunk,
+                    "attention_mask": [1] * len(chunk),
+                    "labels": list(chunk),
+                }
+            )
+        return examples

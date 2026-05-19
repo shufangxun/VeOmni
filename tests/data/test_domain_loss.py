@@ -125,6 +125,50 @@ def test_text_trainer_accumulates_domain_loss(monkeypatch):
     assert metrics["training/domain/knowledge/tokens"] == 2
 
 
+def test_text_trainer_gathers_domain_names_before_reducing(monkeypatch):
+    monkeypatch.setattr(
+        text_trainer_module,
+        "get_parallel_state",
+        lambda: types.SimpleNamespace(dp_group="dp", sp_enabled=False),
+    )
+    monkeypatch.setattr(text_trainer_module.dist, "is_available", lambda: True)
+    monkeypatch.setattr(text_trainer_module.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(text_trainer_module.dist, "get_world_size", lambda group=None: 2)
+
+    def fake_all_gather_object(output, value, group=None):
+        assert group == "dp"
+        assert value == ["web"]
+        output[0] = ["sft"]
+        output[1] = value
+
+    reduce_calls = []
+
+    def fake_all_reduce(value, op="sum", group=None):
+        del op
+        assert group == "dp"
+        reduce_calls.append(value)
+        return value
+
+    monkeypatch.setattr(text_trainer_module.dist, "all_gather_object", fake_all_gather_object)
+    monkeypatch.setattr(text_trainer_module, "all_reduce", fake_all_reduce)
+
+    trainer = _trainer()
+    stats = _loss_stats()
+    stats["web"]["loss_sum"] = 3.0
+    stats["web"]["tokens"] = 2.0
+
+    metrics = trainer._build_train_group_metrics(
+        stats,
+        aggregation_time=0.001,
+        metric_prefix="training/domain",
+        aggregation_metric_name="training/domain_loss/aggregation_time_ms",
+    )
+
+    assert reduce_calls == [(0.0, 0.0), (3.0, 2.0), 0.001]
+    assert "training/domain/sft/loss" not in metrics
+    assert metrics["training/domain/web/loss"] == pytest.approx(1.5)
+
+
 def test_text_trainer_skips_missing_domain_metadata():
     trainer = _trainer()
     micro_batch = {

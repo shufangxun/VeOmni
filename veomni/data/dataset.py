@@ -1373,21 +1373,35 @@ def build_weighted_multisource_dataset(
     source_ids = multisource_config.get(
         "source_names", source_names
     )  # if source_ids is not provided, use source_names as source_ids
+    preprocesses = multisource_config.get("preprocess")
+    text_keys_per_source = multisource_config.get("text_keys")
 
     level = multisource_config.get("level", "sample")
     stopping_strategy = multisource_config.get("stopping_strategy", "first_exhausted")
     split_by_node = multisource_config.get("upstream_sharded", True)
 
-    datasets = [
-        build_iterable_dataset(
-            train_path=source,
-            seed=seed,
-            transform=transform,
-            split_by_node=split_by_node,
-            shuffle=shuffle,
+    datasets = []
+    for idx, source in enumerate(sources):
+        source_transform = transform
+        if transform is not None and (preprocesses is not None or text_keys_per_source is not None):
+            source_transform_kwargs = {"ds_idx": idx}
+            if source_names is not None:
+                source_transform_kwargs["source_name"] = source_names[idx]
+            if preprocesses is not None:
+                source_transform_kwargs["preprocess"] = preprocesses[idx]
+            if text_keys_per_source is not None:
+                source_transform_kwargs["text_keys"] = text_keys_per_source[idx]
+            source_transform = partial(transform, **source_transform_kwargs)
+
+        datasets.append(
+            build_iterable_dataset(
+                train_path=source,
+                seed=seed,
+                transform=source_transform,
+                split_by_node=split_by_node,
+                shuffle=shuffle,
+            )
         )
-        for source in sources
-    ]
 
     return WeightedMultiSourceDataset(
         datasets=datasets,

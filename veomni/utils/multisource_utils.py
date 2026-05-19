@@ -59,4 +59,10 @@ def _parse_multisource_config(multisource_config: dict):
             "source_num is not equal to length of"
             + f" concat_sources, source_num vs concat_sources: {source_num} vs {multisource_config['concat_sources']}."
         )
+    for optional_field in ("preprocess", "text_keys"):
+        if optional_field in multisource_config:
+            assert len(multisource_config[optional_field]) == source_num, (
+                f"source_num is not equal to length of {optional_field}, "
+                + f"source_num vs {optional_field}: {source_num} vs {multisource_config[optional_field]}."
+            )
     return multisource_config

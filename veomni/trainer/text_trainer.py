@@ -18,6 +18,7 @@ from collections import defaultdict
 from typing import Any, Dict, List, Optional
 
 import torch
+from torch import distributed as dist
 
 from ..arguments import VeOmniArguments
 from ..data import (
@@ -227,6 +228,29 @@ class TextTrainer:
     def _metric_group_name(group_name: str) -> str:
         return group_name.replace("/", "_")
 
+    def _ordered_train_group_names(
+        self,
+        group_stats: Dict[str, Dict[str, float]],
+        ordered_group_names: Optional[List[str]] = None,
+    ) -> List[str]:
+        group_names = list(ordered_group_names or [])
+        known_names = set(group_names)
+        local_extra_names = sorted(set(group_stats.keys()) - known_names)
+
+        if ordered_group_names is not None and not local_extra_names:
+            return group_names
+
+        if dist.is_available() and dist.is_initialized():
+            dp_group = get_parallel_state().dp_group
+            gathered_names = [None for _ in range(dist.get_world_size(group=dp_group))]
+            dist.all_gather_object(gathered_names, local_extra_names, group=dp_group)
+            extra_names = sorted({name for names in gathered_names for name in names})
+        else:
+            extra_names = local_extra_names
+
+        group_names.extend(name for name in extra_names if name not in known_names)
+        return group_names
+
     def _build_train_group_metrics(
         self,
         group_stats: Dict[str, Dict[str, float]],
@@ -236,9 +260,7 @@ class TextTrainer:
         ordered_group_names: Optional[List[str]] = None,
     ) -> Dict[str, float]:
         metrics = {}
-        group_names = list(ordered_group_names or [])
-        for group_name in sorted(set(group_stats.keys()) - set(group_names)):
-            group_names.append(group_name)
+        group_names = self._ordered_train_group_names(group_stats, ordered_group_names)
 
         for group_name in group_names:
             local_stats = group_stats.get(group_name, {})

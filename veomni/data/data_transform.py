@@ -50,6 +50,17 @@ def split_into_chunks(sequence: Sequence[int], chunk_size: int) -> List[List[int
     return chunks
 
 
+def _get_text_example(example: Dict[str, Any], text_keys: Union[str, List[str]]) -> Any:
+    if isinstance(text_keys, str):
+        return example[text_keys]
+    if isinstance(text_keys, list):
+        for key in text_keys:
+            if key in example:
+                return example[key]
+        raise ValueError(f"None of the keys {text_keys} are found in the example.")
+    raise ValueError(f"text_keys must be a string or a list of strings, but got {type(text_keys)}")
+
+
 @DATA_TRANSFORM_REGISTRY.register("plaintext")
 def process_plaintext_example(
     example: Dict[str, Any],
@@ -112,6 +123,41 @@ def process_conversation_example(
     if domain_name is not None:
         tokenized_example["domain_name"] = str(domain_name)
     return [tokenized_example]
+
+
+@DATA_TRANSFORM_REGISTRY.register("mixed_text")
+def process_mixed_text_example(
+    example: Dict[str, Any],
+    chat_template: "ChatTemplate",
+    max_seq_len: int,
+    text_keys: Union[str, List[str], None] = None,
+    preprocess: str = None,
+    **kwargs,
+) -> List[Dict[str, "torch.Tensor"]]:
+    if preprocess is None:
+        raise ValueError("mixed_text requires per-source preprocess from multisource data yaml.")
+
+    if preprocess == "plaintext":
+        text_keys = text_keys or "content_split"
+        text_example = _get_text_example(example, text_keys)
+        tokenized_examples = chat_template.encode_pretrain_text(text_example, max_seq_len=max_seq_len)
+    elif preprocess == "conversation":
+        text_keys = text_keys or "messages"
+        text_example = _get_text_example(example, text_keys)
+        tokenized_examples = [chat_template.encode_messages(text_example, max_seq_len=max_seq_len)]
+    else:
+        raise ValueError(
+            f"Unsupported mixed_text preprocess: {preprocess}. Supported values are: plaintext, conversation."
+        )
+
+    domain_name = example.get("domain_name", example.get("domain"))
+    examples = []
+    for tokenized_example in tokenized_examples:
+        processed_example = {k: torch.tensor(v) for k, v in tokenized_example.items()}
+        if domain_name is not None:
+            processed_example["domain_name"] = str(domain_name)
+        examples.append(processed_example)
+    return examples
 
 
 @DATA_TRANSFORM_REGISTRY.register("dpo")
