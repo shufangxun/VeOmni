@@ -11,10 +11,10 @@ Before implementing, check which areas your change affects:
 |------|--------------|----------------|
 | `veomni/trainer/` | All trainer subclasses (`TextTrainer`, `VLMTrainer`, `DitTrainer`, RL trainers) | Changing `BaseTrainer` method signatures breaks all subclasses |
 | `veomni/data/data_collator.py` | All modalities (text, VLM, DiT) | Collators are tightly coupled to model-specific preprocessing |
-| `veomni/distributed/` | Both FSDP2 and legacy FSDP1 paths | Shared distributed code is used differently by each path |
+| `veomni/distributed/` | FSDP2 + ExtraParallel/MoE/SP paths | Shared distributed code is used by many downstream modalities |
 | `veomni/models/auto.py`, `loader.py` | Model registry, import-time side effects | `MODELING_REGISTRY` is populated at import time; moving registrations breaks loading |
 | `configs/` | YAML config keys | Renaming config keys breaks existing training configs silently |
-| `veomni/models/transformers/*/` | `__init__.py` version gates | Models have v4/v5 transformers branches; changes must work on both |
+| `veomni/models/transformers/*/` | `__init__.py` registration entry points | All models ship a patchgen-generated v5 path under `generated/`; never import or call legacy `modeling_<m>.py` or `apply_veomni_<m>_patch()` (these no longer exist) |
 
 ## Refactoring Safety Rules
 
@@ -29,7 +29,7 @@ When restructuring code (same behavior, better structure):
 
 - `veomni.models.auto` registration depends on **import-time side effects** — moving registrations into functions or delaying them breaks model loading.
 - Renaming config keys **silently breaks** existing YAML configs in `configs/` — grep all YAML files first.
-- `veomni.distributed` modules are used differently by **FSDP1 vs FSDP2** — test both if touching shared code.
+- `veomni.distributed` modules feed into ExtraParallel/MoE/SP — touching shared code may affect every modality, so run the cross-cutting parallel tests.
 - Data collators in `veomni/data/data_collator.py` are coupled to `DEFAULT_DATA_COLLATE_INFO` — adding new tensor keys requires updating the collate info table.
 - `MainCollator` has **strict SP ordering** (pad → slice → FA kwargs → slice position_ids) — reordering breaks SP correctness.
 - `position_ids == 0` marks segment boundaries for FA varlen — any transform that produces position_ids must preserve this convention.

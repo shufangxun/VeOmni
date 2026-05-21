@@ -34,7 +34,7 @@ from ..utils.dist_utils import all_reduce
 from ..utils.loss_utils import count_loss_token
 from ..utils.model_utils import pretty_print_trainable_parameters
 from ..utils.multisource_utils import parse_multisource_config
-from .base import BaseTrainer
+from .base import BaseTrainer, _collect_muon_kwargs
 
 
 logger = helper.create_logger(__name__)
@@ -192,8 +192,9 @@ class VLMTrainer:
                 self.base.model.thinker.visual.requires_grad_(False)
                 self.base.model.thinker.visual.merger.requires_grad_(True)
             else:
-                # Resolve both paths so freeze_vit works for the transformers v4-style Back Compatible alias
-                # and the nested layout used by the v5-style Qwen3.5 models.
+                # Resolve both flat and nested visual-module layouts to cover
+                # both the plain `model.visual` shape and Qwen3.5-VL's nested
+                # layout.
                 visual = _get_vlm_visual_module(self.base.model)
                 if visual is None:
                     raise AttributeError(f"Cannot find visual module for model_type={model_config.model_type}.")
@@ -308,6 +309,7 @@ class VLMTrainer:
             param_groups=param_groups,
             no_decay_modules=args.train.optimizer.no_decay_modules,
             no_decay_params=args.train.optimizer.no_decay_params,
+            muon_kwargs=_collect_muon_kwargs(args.train.optimizer),
         )
 
     def on_train_begin(self):

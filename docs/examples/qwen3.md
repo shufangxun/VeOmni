@@ -7,7 +7,7 @@ This guide uses Qwen3 as the reference dense LLM path in VeOmni. It covers pretr
 New model development targets transformers v5 and FSDP2:
 
 ```shell
-uv sync --no-group transformers-stable --extra transformers5-exp --extra gpu --extra audio --dev
+uv sync --extra gpu --extra audio --dev
 source .venv/bin/activate
 ```
 

@@ -5,7 +5,7 @@ This guide documents the Qwen3 SigLIP VLM path: a SigLIP vision tower, a pixel-s
 ## Environment
 
 ```shell
-uv sync --no-group transformers-stable --extra transformers5-exp --extra gpu --extra audio --dev
+uv sync --extra gpu --extra audio --dev
 source .venv/bin/activate
 ```
 

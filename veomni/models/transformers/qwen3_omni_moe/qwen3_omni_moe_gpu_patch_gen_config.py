@@ -575,6 +575,12 @@ def qwen3_omni_moe_vision_forward_patched(
 ) -> tuple | BaseModelOutputWithDeepstackFeatures:
     hidden_states = self.patch_embed(hidden_states)
 
+    # Modification: materialise `grid_thw` to a host list once and reuse for `cu_seqlens` /
+    # `total_seq_len` build below. Unpatched paths derive shape metadata straight off the GPU
+    # `grid_thw` tensor (`repeat_interleave(GPU_repeats)` syncs, `cu_seqlens[-1]` as a 0-D
+    # reshape arg syncs, `total_seq_len.item()` syncs). Mirrors the qwen3_5 / qwen3_vl fix.
+    grid_thw_list = grid_thw.tolist()
+
     pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
 
     sp_group = get_parallel_state().sp_group if get_parallel_state().sp_enabled else None
@@ -585,17 +591,24 @@ def qwen3_omni_moe_vision_forward_patched(
     # --- Patch.1 ---
     hidden_states = hidden_states + pos_embeds
 
-    cu_seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).cumsum(
-        dim=0,
+    # Modification: build cu_seqlens on the host from grid_thw_list (was
+    # repeat_interleave(GPU_repeats).cumsum); total_seq_len becomes a plain Python int.
+    cu_seqlens_list = [0]
+    for t, h, w in grid_thw_list:
+        frame_len = h * w
+        for _ in range(t):
+            cu_seqlens_list.append(cu_seqlens_list[-1] + frame_len)
+    total_seq_len = cu_seqlens_list[-1]
+    cu_seqlens = torch.tensor(
+        cu_seqlens_list,
+        device=hidden_states.device,
         dtype=grid_thw.dtype if torch.jit.is_tracing() else torch.int32,
     )
-    cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
 
     rotary_pos_emb = self.rot_pos_emb(grid_thw)
-    # Capture total_seq_len from cu_seqlens before any SP slicing.
-    total_seq_len = cu_seqlens[-1]
     seq_len, _ = hidden_states.size()
     hidden_states = hidden_states.reshape(seq_len, -1)
+    # total_seq_len is already a Python int — no sync to use as a shape arg.
     rotary_pos_emb = rotary_pos_emb.reshape(total_seq_len, -1)
     emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
     position_embeddings = (emb.cos(), emb.sin())
@@ -611,7 +624,7 @@ def qwen3_omni_moe_vision_forward_patched(
     # --- Patch.2 ---
     if sp_group is not None:
         sp_size = getattr(get_parallel_state(), "sp_size", 1)
-        pad_seq_len = seq_len * sp_size - total_seq_len.item()
+        pad_seq_len = seq_len * sp_size - total_seq_len  # already host int
         if pad_seq_len > 0:
             new_cumsum = cu_seqlens[-1] + pad_seq_len
             cu_seqlens = torch.cat([cu_seqlens, new_cumsum.unsqueeze(0)], dim=0)
@@ -684,6 +697,12 @@ def qwen3_omni_moe_audio_forward_patched(
     aftercnn_lens=None,
     **kwargs,
 ):
+    r"""
+    feature_lens (`torch.LongTensor` of shape `(batch_size,)`):
+        mel length
+    aftercnn_lens (`torch.LongTensor` of shape `(batch_size,)`):
+        mel length after cnn
+    """
     # --- Patch.1 ---
     input_features = input_features.permute(1, 0)  # (len, num_mel_bins) -> (num_mel_bins, len)
     # --- Patch.1 ---
@@ -812,6 +831,12 @@ def qwen3_omni_moe_thinker_text_model_forward_patched(
     deepstack_visual_embeds: Optional[list[torch.Tensor]] = None,
     **kwargs: Unpack[FlashAttentionKwargs],
 ) -> tuple | MoeModelOutputWithPast:
+    r"""
+    visual_pos_masks (`torch.Tensor` of shape `(batch_size, seqlen)`, *optional*):
+        The mask of the visual positions.
+    deepstack_visual_embeds (`list[torch.Tensor]`, *optional*):
+        The deepstack visual embeddings. The shape is (num_layers, visual_seqlen, embed_dim).
+    """
     if (input_ids is None) ^ (inputs_embeds is not None):
         raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
@@ -994,6 +1019,10 @@ def qwen3_omni_moe_thinker_get_audio_features_patched(
     audio_feature_lengths=None,
     **kwargs,
 ):
+    r"""
+    audio_feature_lengths (`torch.LongTensor` of shape `(num_audios)`, *optional*):
+        The length of feature shape of each audio in LLM.
+    """
     audio_outputs = self.audio_tower(
         input_features,
         feature_lens=audio_feature_lengths,
@@ -1075,6 +1104,20 @@ def qwen3_omni_moe_thinker_forward_patched(
     video_second_per_grid=None,
     **kwargs,
 ) -> tuple | Qwen3OmniMoeThinkerCausalLMOutputWithLogProbs:
+    r"""
+    image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
+        The temporal, height and width of feature shape of each image in LLM.
+    video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
+        The temporal, height and width of feature shape of each video in LLM.
+    audio_feature_lengths (`torch.LongTensor` of shape `(num_audios)`, *optional*):
+        The length of feature shape of each audio in LLM.
+    rope_deltas (`torch.LongTensor` of shape `(batch_size, )`, *optional*):
+        The rope index difference between sequence length and multimodal rope.
+    use_audio_in_video (`bool`, *optional*):
+        Whether or not use audio track in video, should same as the parameter in `process_audio_info`.
+    video_second_per_grid (`torch.LongTensor` of shape `(num_videos)`, *optional*):
+        Number of seconds per grid for each video, used for temporal feature mapping.
+    """
     output_router_logits = (
         output_router_logits if output_router_logits is not None else self.config.text_config.output_router_logits
     )
@@ -1121,8 +1164,8 @@ def qwen3_omni_moe_thinker_forward_patched(
         if self.training and get_parallel_state().sp_enabled:
             audio_features = gather_outputs(audio_features, gather_dim=0, group=get_parallel_state().sp_group)
         # --- Patch.4 ---
-        n_audio_tokens = audio_mask.sum().long().item()
-        audio_features = audio_features[:n_audio_tokens]
+        # `masked_scatter` consumes exactly `audio_mask.sum()` leading rows; padded audio rows are
+        # trailing and unused — no `[:n]` slice / `.item()` sync needed (mirrors qwen3_5 fix).
         audio_mask_expanded = audio_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
         inputs_embeds = inputs_embeds.masked_scatter(audio_mask_expanded, audio_features)
     elif get_parallel_state().fsdp_enabled:
@@ -1146,16 +1189,13 @@ def qwen3_omni_moe_thinker_forward_patched(
             image_embeds = gather_outputs(image_embeds, gather_dim=0, group=get_parallel_state().sp_group)
         # --- Patch.4 ---
 
-        n_image_tokens = image_mask.sum().long().item()
         image_mask = image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device, non_blocking=True)
 
-        image_embeds = image_embeds[:n_image_tokens]
-        deepstack_image_embeds = [embed[:n_image_tokens] for embed in deepstack_image_embeds]
-        n_image_features = image_embeds.shape[0]
-        if n_image_tokens != n_image_features:
-            raise ValueError(
-                f"Image features and image tokens do not match: tokens: {n_image_tokens}, features {n_image_features}"
-            )
+        # `masked_scatter` consumes exactly `image_mask.sum()` leading rows; padded rows are
+        # trailing and unused — no `[:n]` slice / `.item()` sync needed. The previous
+        # `n_image_tokens != n_image_features` assertion was a debug guard that also forced the
+        # sync; masked_scatter's own size mismatch already raises with a clear message if the
+        # underlying invariant is violated.
         inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
     elif get_parallel_state().fsdp_enabled:
         # --- Patch.5 ---
@@ -1178,16 +1218,10 @@ def qwen3_omni_moe_thinker_forward_patched(
             video_embeds = gather_outputs(video_embeds, gather_dim=0, group=get_parallel_state().sp_group)
         # --- Patch.4 ---
 
-        n_video_tokens = video_mask.sum().long().item()
         video_mask = video_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device, non_blocking=True)
 
-        video_embeds = video_embeds[:n_video_tokens]
-        deepstack_video_embeds = [embed[:n_video_tokens] for embed in deepstack_video_embeds]
-        n_video_features = video_embeds.shape[0]
-        if n_video_tokens != n_video_features:
-            raise ValueError(
-                f"Video features and video tokens do not match: tokens: {n_video_tokens}, features {n_video_features}"
-            )
+        # Same as image branch above: drop the `[:n]` slice, the `.item()` sync, and the debug
+        # assertion (masked_scatter raises on size mismatch).
         inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
     elif get_parallel_state().fsdp_enabled:
         # --- Patch.5 ---
@@ -1342,6 +1376,8 @@ def qwen3_omni_moe_thinker_forward_patched(
                 logits=logits,
                 labels=labels,
                 vocab_size=self.config.text_config.vocab_size,
+                hidden_states=hidden_states,
+                weights=self.lm_head.weight,
                 ignore_index=IGNORE_INDEX,
                 **kwargs,
             )

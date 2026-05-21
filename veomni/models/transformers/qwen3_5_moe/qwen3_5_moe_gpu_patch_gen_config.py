@@ -50,7 +50,7 @@ from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
     load_balancing_loss_func,
 )
 from transformers.processing_utils import Unpack
-from transformers.utils import TransformersKwargs, auto_docstring, logging
+from transformers.utils import TransformersKwargs, logging
 
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.models.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config import (
@@ -59,13 +59,17 @@ from veomni.models.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config import (
     qwen3_5_gated_deltanet_init_patched,
     qwen3_5_model_get_image_features,
     qwen3_5_model_get_placeholder_mask,
+    qwen3_5_text_model_update_linear_attn_mask,
+    qwen3_5_vision_attention_forward_patched,
     qwen3_5_vision_model_dummy_forward,
     qwen3_5_vision_model_fast_pos_embed_interpolate,
     qwen3_5_vision_model_forward,
+    qwen3_5_vision_model_rot_pos_emb,
 )
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.model_outputs import MoeCausalLMOutputWithLogProbs
+from veomni.utils.moe_router_replay import get_active_replay, maybe_replay_indices
 
 
 logger = logging.get_logger(__name__)
@@ -86,13 +90,18 @@ config.add_import("veomni.ops", names=["fused_moe_forward"])
 config.add_import("veomni.utils.device", names=["get_device_id"])
 config.add_import(
     "veomni.distributed.sequence_parallel.ulysses",
-    names=["gather_seq_scatter_heads", "gather_heads_scatter_seq", "gather_outputs", "slice_input_tensor"],
+    names=["gather_seq_scatter_heads", "gather_heads_scatter_seq"],
 )
-config.add_import("veomni.distributed.sequence_parallel", names=["sp_pad_and_slice"])
+# gather_outputs / slice_input_tensor live in veomni.distributed.sequence_parallel.data
+# (re-exported by the package __init__), not in .ulysses.
+config.add_import(
+    "veomni.distributed.sequence_parallel", names=["gather_outputs", "slice_input_tensor", "sp_pad_and_slice"]
+)
 config.add_import("veomni.utils.constants", names=["IMAGE_INPUT_INDEX", "VIDEO_INPUT_INDEX"])
 # Surface ``MoeCausalLMOutputWithLogProbs`` so the patched text ``forward`` can return
 # per-token log-probs in the unified MoE output dataclass.
 config.add_import("veomni.utils.model_outputs", names=["MoeCausalLMOutputWithLogProbs"])
+config.add_import("veomni.utils.moe_router_replay", names=["get_active_replay", "maybe_replay_indices"])
 config.drop_import_names(
     "FusedRMSNormGated",
     "causal_conv1d_fn",
@@ -144,6 +153,12 @@ slice_input_tensor = None
 veomni_rms_norm_gated = None  # OpSlot, declared in post-import block above
 veomni_causal_conv1d = None  # OpSlot, declared in post-import block above
 veomni_chunk_gated_delta_rule = None  # OpSlot, declared in post-import block above
+
+# Mirror the GPU sentinel from qwen3_5_gpu_patch_gen_config: this config
+# registers Qwen3_5MoeVisionAttention.forward as the consumer, so the
+# pre-computed `vision_max_seqlen` int is safe to write. See Patch.5 in
+# qwen3_5_gpu_patch_gen_config.py for the full rationale.
+config.add_post_import_block("_VEOMNI_VISION_ATTENTION_PATCHED = True")
 
 
 # ── RMSNorm (OpSlot guard, functional Liger kernel) ──────────────────────────
@@ -197,7 +212,7 @@ def qwen3_5_moe_model_init_patched(self, config):
 
 @config.override_method(
     "Qwen3_5MoeSparseMoeBlock.forward",
-    description="Avoid in-place += on custom autograd Function output",
+    description="Avoid in-place += on custom autograd Function output; call maybe_replay_indices for RL router replay",
 )
 def qwen3_5_moe_sparse_moe_block_forward_patched(
     self, hidden_states: torch.Tensor
@@ -205,7 +220,34 @@ def qwen3_5_moe_sparse_moe_block_forward_patched(
     batch_size, sequence_length, hidden_dim = hidden_states.shape
     hidden_states_reshaped = hidden_states.view(-1, hidden_dim)
     shared_expert_output = self.shared_expert(hidden_states_reshaped)
-    _, routing_weights, selected_experts = self.gate(hidden_states_reshaped)
+    router_logits, routing_weights, selected_experts = self.gate(hidden_states_reshaped)
+    # MoE router replay: when an RL framework has installed a manager via
+    # ``set_active_replay``, the manager may substitute ``selected_experts``
+    # with previously recorded target indices. The manager's sole
+    # responsibility is choosing indices; all model-specific post-topk
+    # weight math (gather, renorm, dtype cast) is replicated here so the
+    # cross-framework controller stays model-agnostic.
+    #
+    # ASYMMETRY with qwen3_moe: Qwen3.5-MoE's ``TopKRouter.forward``
+    # reassigns its local ``router_logits`` variable to
+    # ``softmax(router_logits)`` before returning (the same latent
+    # double-softmax quirk that upstream fixed in Qwen3-MoE via #715). So
+    # the value bound here is ALREADY the post-softmax probability matrix
+    # required by the RR contract; we pass it through directly as
+    # ``routing_scores``. Recomputing ``softmax`` here would produce
+    # ``softmax(softmax(logits))`` and silently corrupt replay weights.
+    # If Qwen3.5-MoE is ever fixed the same way as qwen3_moe, switch this
+    # to the qwen3_moe form (recompute softmax from raw logits).
+    #
+    # Qwen3.5-MoE's native router always renormalizes top-k probs (see the
+    # ``router_top_value /= router_top_value.sum(...)`` in its TopKRouter),
+    # so we always renorm the gathered weights, no conditional.
+    if get_active_replay() is not None:
+        target_dtype = routing_weights.dtype
+        selected_experts = maybe_replay_indices(self.gate, router_logits, selected_experts)
+        routing_weights = router_logits.gather(1, selected_experts)
+        routing_weights = routing_weights / routing_weights.sum(-1, keepdim=True)
+        routing_weights = routing_weights.to(target_dtype)
     expert_output = self.experts(hidden_states_reshaped, selected_experts, routing_weights)
 
     shared_expert_output = F.sigmoid(self.shared_expert_gate(hidden_states_reshaped)) * shared_expert_output
@@ -233,6 +275,12 @@ config.override_method(
 )
 
 config.override_method(
+    "Qwen3_5MoeVisionModel.rot_pos_emb",
+    replacement=qwen3_5_vision_model_rot_pos_emb,
+    description="Accept pre-materialized grid_thw metadata to avoid redundant host sync in vision RoPE setup.",
+)
+
+config.override_method(
     "Qwen3_5MoeVisionModel.fast_pos_embed_interpolate",
     replacement=qwen3_5_vision_model_fast_pos_embed_interpolate,
     description="Optimized bilinear interpolation for high-resolution vision embeddings, adapted from vLLM.",
@@ -248,6 +296,16 @@ config.override_method(
     "Qwen3_5MoeVisionModel.dummy_forward",
     replacement=qwen3_5_vision_model_dummy_forward,
     description="Add dummy_forward to prevent FSDP reduce-scatter hang on uneven multimodal batches.",
+)
+
+config.override_method(
+    "Qwen3_5MoeVisionAttention.forward",
+    replacement=qwen3_5_vision_attention_forward_patched,
+    description=(
+        "Read pre-computed `vision_max_seqlen` (Python int) from kwargs to avoid "
+        "the per-block GPU->CPU sync that flash_attn_varlen_func incurs when "
+        "`max_length_q/k` are 0-D GPU tensors (FA's C++ binding `.item()`s them)."
+    ),
 )
 
 
@@ -334,12 +392,14 @@ def qwen3_5_moe_model_forward_patched(
             # (seq_len // sp_size, hidden_size) to  (seq_len, hidden_size // sp_size)
             image_embeds = gather_outputs(image_embeds, gather_dim=0, group=get_parallel_state().sp_group)
 
-        n_image_tokens = image_mask.sum().long().item()
         embeds_image_mask = (
             image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device, non_blocking=True)
         )
-        # Slice tensor to drop any padded image tokens
-        image_embeds = image_embeds[:n_image_tokens]
+        # `masked_scatter` consumes exactly `image_mask.sum()` elements from `image_embeds`, taking the
+        # leading rows in order — image-placeholder positions in `input_ids` are laid out in the same
+        # order as their vision tokens, and the data collator pads the vision sequence only at the
+        # *end*. So any padded vision rows are trailing and simply go unused; no `image_embeds[:n]`
+        # slice is needed, which also removes the `image_mask.sum().item()` host-device sync.
         image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
         inputs_embeds = inputs_embeds.masked_scatter(embeds_image_mask, image_embeds)
 
@@ -376,13 +436,12 @@ def qwen3_5_moe_model_forward_patched(
             # (seq_len // sp_size, hidden_size) to  (seq_len, hidden_size // sp_size)
             video_embeds = gather_outputs(video_embeds, gather_dim=0, group=get_parallel_state().sp_group)
 
-        n_video_tokens = video_mask.sum().long().item()
         embeds_video_mask = (
             video_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device, non_blocking=True)
         )
-
-        # Slice tensor to drop any padded video tokens
-        video_embeds = video_embeds[:n_video_tokens]
+        # As with `image_embeds` above: `masked_scatter` uses exactly `video_mask.sum()` leading rows,
+        # any collator-padded vision rows are trailing and unused — no `video_embeds[:n]` slice (and no
+        # `video_mask.sum().item()` host-device sync) needed.
         video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
         inputs_embeds = inputs_embeds.masked_scatter(embeds_video_mask, video_embeds)
 
@@ -423,7 +482,6 @@ def qwen3_5_moe_model_forward_patched(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
             past_key_values=past_key_values,
-            mm_token_type_ids=mm_token_type_ids,
         )
     else:
         # --- Patch.3: Transpose pre-computed position_ids if they follow VeOmni collation format ---
@@ -455,15 +513,17 @@ def qwen3_5_moe_model_forward_patched(
 
 # Surface ``Qwen3_5MoeCausalLMOutputWithLogProbs`` so the patched multimodal
 # ``forward`` can return per-token log-probs while preserving ``rope_deltas``.
+# See qwen3_5_gpu_patch_gen_config.py for why @auto_docstring is skipped.
 @config.add_helper_after("Qwen3_5MoeCausalLMOutputWithPast")
 @dataclass
-@auto_docstring(
-    custom_intro="""
-    Base class for Qwen3_5Moe causal language model outputs extended with per-token log-prob fields.
-    """
-)
 class Qwen3_5MoeCausalLMOutputWithLogProbs(Qwen3_5MoeCausalLMOutputWithPast):
     r"""
+    loss (`torch.FloatTensor` of shape `(1,)`, *optional*, returned when `labels` is provided):
+        Language modeling loss (for next-token prediction).
+    logits (`torch.FloatTensor` of shape `(batch_size, sequence_length, config.vocab_size)`):
+        Prediction scores of the language modeling head (scores for each vocabulary token before SoftMax).
+    rope_deltas (`torch.LongTensor` of shape `(batch_size, )`, *optional*):
+        The rope index difference between sequence length and multimodal rope.
     log_probs (`torch.FloatTensor`, *optional*):
         Per-token log probabilities returned by VeOmni's fused loss path.
     entropy (`torch.FloatTensor`, *optional*):
@@ -573,6 +633,12 @@ config.override_method(
     replacement=qwen3_5_gated_deltanet_forward_patched,
     name_map=_NAME_MAP,
     description="Support varlen flash linear attention and Ulysses SP in Qwen3_5MoeGatedDeltaNet.forward",
+)
+
+config.override_method(
+    "Qwen3_5MoeTextModel._update_linear_attn_mask",
+    replacement=qwen3_5_text_model_update_linear_attn_mask,
+    description="Avoid host-device sync: decide linear-attention padding-mask zeroing without reading GPU scalars.",
 )
 
 
@@ -725,7 +791,12 @@ def qwen3_5_moe_forcausallm_forward_patched(
             # returns (loss, logits, log_probs, entropy); unpack to match the
             # OpSlot branch above.
             loss, logits, log_probs, entropy = self.loss_function(
-                logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs
+                logits=logits,
+                labels=labels,
+                vocab_size=self.config.vocab_size,
+                hidden_states=hidden_states,
+                weights=self.lm_head.weight,
+                **kwargs,
             )
     else:
         logits = self.lm_head(hidden_states)
@@ -826,7 +897,12 @@ def qwen3_5_moe_forconditional_generation_forward_patched(
             # returns (loss, logits, log_probs, entropy); unpack to match the
             # OpSlot branch above.
             loss, logits, log_probs, entropy = self.loss_function(
-                logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size, **kwargs
+                logits=logits,
+                labels=labels,
+                vocab_size=self.config.text_config.vocab_size,
+                hidden_states=hidden_states,
+                weights=self.lm_head.weight,
+                **kwargs,
             )
     else:
         logits = self.lm_head(hidden_states)

@@ -276,6 +276,7 @@ def _run_trainer_save_hf_safetensor(model_name: str, ep_size: int):
     shutil.rmtree(get_output_dir(model_name, ep_size))
 
 
+# MoE save/load coverage.
 TEST_MODELS = ["qwen3_moe", "deepseek_v3"]
 TEST_EP_SIZES = [1, 4, 8]
 

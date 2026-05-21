@@ -61,14 +61,9 @@ Phase 5: Knowledge capture           -> pending
 4. Check dependencies — different transformers version? Different PyTorch version?
 5. **If a package version upgrade is suspected**, create isolated uv environments to bisect:
    ```bash
-   # Create a separate env with the old version
-   uv venv .venv-old
-   VIRTUAL_ENV=.venv-old uv sync --extra gpu --dev
-   VIRTUAL_ENV=.venv-old uv pip install transformers==4.57.3  # or whichever old version
-
-   # Create a separate env with the new version
-   uv venv .venv-new
-   VIRTUAL_ENV=.venv-new uv sync --no-group transformers-stable --extra transformers5-exp --extra gpu --dev
+   # Create the default env on the default pin (`transformers-stable` → 5.2.0).
+   uv venv .venv-default
+   VIRTUAL_ENV=.venv-default uv sync --extra gpu --dev
    ```
    Run the same reproducer in both envs to confirm the version is the root cause. This avoids polluting the main `.venv/`.
 

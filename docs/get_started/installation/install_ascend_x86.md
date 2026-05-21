@@ -51,15 +51,9 @@ uv sync --locked  --extra npu --extra audio
 git clone https://github.com/ByteDance-Seed/VeOmni.git
 cd VeOmni
 
-# Choose one of the following installation options based on your needs:
-# Option 1: Stable version (transformers < 5.0)
-pip install -e .[npu,transformers-stable]
+pip install -e .[npu]
+pip install transformers==5.2.0
 pip install datasets==2.21.0
-
-# Option 2: Experimental version for new models (transformers ≥ 5.0)
-# Note: This uses the transformers5-exp extra which includes transformers 5.0+ support
-# as specified in pyproject.toml (experimental and under development)
-# pip install -e .[npu,transformers5-exp]
 ```
 
 ### Set up CANN environment before installing torchcodec

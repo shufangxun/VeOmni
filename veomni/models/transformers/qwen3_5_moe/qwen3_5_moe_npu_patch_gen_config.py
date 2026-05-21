@@ -14,8 +14,19 @@
 """
 Patch configuration for Qwen3_5Moe NPU/SP patched modeling generation.
 
-Regen command:
-python -m veomni.patchgen.run_codegen veomni.models.transformers.qwen3_5_moe.qwen3_5_moe_npu_patch_gen_config -o veomni/models/transformers/qwen3_5_moe/generated --diff
+Regen command (preferred): `make patchgen` — runs all gen_configs together.
+
+Do NOT regenerate this file in isolation via
+``python -m veomni.patchgen.run_codegen veomni.models.transformers.qwen3_5_moe.qwen3_5_moe_npu_patch_gen_config ...``
+This gen_config imports helpers from
+``qwen3_5_moe_gpu_patch_gen_config``; when patchgen runs it alone without
+first running the GPU config, the generated file drops several imports
+(``copy``, ``functools.partial``, ``types.SimpleNamespace``,
+``torch.distributed`` alias, etc.) that are still referenced by the code
+body, producing a NameError at import time. Joint regen via
+``make patchgen`` (which runs ``--all`` in one Python process) populates
+the shared PatchConfig state correctly. This is a pre-existing quirk of
+VeOmni patchgen, not specific to router-replay patches.
 
 Patches applied:
 1. Fused MoE expert replacement (merged gate_up_proj layout).
@@ -29,9 +40,11 @@ from veomni.models.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config import (
     qwen3_5_gated_deltanet_init_patched,
     qwen3_5_model_get_image_features,
     qwen3_5_model_get_placeholder_mask,
+    qwen3_5_text_model_update_linear_attn_mask,
     qwen3_5_vision_model_dummy_forward,
     qwen3_5_vision_model_fast_pos_embed_interpolate,
     qwen3_5_vision_model_forward,
+    qwen3_5_vision_model_rot_pos_emb,
 )
 from veomni.models.transformers.qwen3_5.qwen3_5_npu_patch_gen_config import (
     apply_rotary_pos_emb,
@@ -71,14 +84,19 @@ config.add_import("veomni.ops", names=["fused_moe_forward"])
 config.add_import("veomni.utils.device", names=["get_device_id"])
 config.add_import(
     "veomni.distributed.sequence_parallel.ulysses",
-    names=["gather_seq_scatter_heads", "gather_heads_scatter_seq", "gather_outputs", "slice_input_tensor"],
+    names=["gather_seq_scatter_heads", "gather_heads_scatter_seq"],
 )
-config.add_import("veomni.distributed.sequence_parallel", names=["sp_pad_and_slice"])
+# gather_outputs / slice_input_tensor live in veomni.distributed.sequence_parallel.data
+# (re-exported by the package __init__), not in .ulysses.
+config.add_import(
+    "veomni.distributed.sequence_parallel", names=["gather_outputs", "slice_input_tensor", "sp_pad_and_slice"]
+)
 config.add_import("veomni.utils.constants", names=["IMAGE_INPUT_INDEX", "VIDEO_INPUT_INDEX"])
 # Surface ``MoeCausalLMOutputWithLogProbs`` so the patched text ``forward``
 # (re-used from the GPU config) can return per-token log-probs in the unified
 # MoE output dataclass.
 config.add_import("veomni.utils.model_outputs", names=["MoeCausalLMOutputWithLogProbs"])
+config.add_import("veomni.utils.moe_router_replay", names=["get_active_replay", "maybe_replay_indices"])
 config.drop_import_names(
     "FusedRMSNormGated",
     "causal_conv1d_fn",
@@ -124,6 +142,12 @@ slice_input_tensor = None
 veomni_rms_norm_gated = None  # OpSlot, declared in post-import block above
 veomni_causal_conv1d = None  # OpSlot, declared in post-import block above
 veomni_chunk_gated_delta_rule = None  # OpSlot, declared in post-import block above
+
+# Mirror the qwen3_5 NPU sentinel: this NPU config reuses
+# qwen3_5_vision_model_forward (Patch.5) but does NOT register the
+# Qwen3_5MoeVisionAttention.forward consumer. False suppresses the host sync
+# and kwarg leak — see qwen3_5_gpu_patch_gen_config.py Patch.5 for rationale.
+config.add_post_import_block("_VEOMNI_VISION_ATTENTION_PATCHED = False")
 
 
 config.override_method(
@@ -182,6 +206,12 @@ config.override_method(
     "Qwen3_5MoeModel.get_placeholder_mask",
     replacement=qwen3_5_model_get_placeholder_mask,
     description="Extract multimodal placeholder masks from input_ids using self-defined placeholder IDs.",
+)
+
+config.override_method(
+    "Qwen3_5MoeVisionModel.rot_pos_emb",
+    replacement=qwen3_5_vision_model_rot_pos_emb,
+    description="Accept pre-materialized grid_thw metadata to avoid redundant host sync in vision RoPE setup.",
 )
 
 config.override_method(
@@ -265,6 +295,12 @@ config.override_method(
     replacement=qwen3_5_gated_deltanet_forward_patched,
     name_map=_NAME_MAP,
     description="Support varlen flash linear attention and Ulysses SP in Qwen3_5MoeGatedDeltaNet.forward",
+)
+
+config.override_method(
+    "Qwen3_5MoeTextModel._update_linear_attn_mask",
+    replacement=qwen3_5_text_model_update_linear_attn_mask,
+    description="Avoid host-device sync: decide linear-attention padding-mask zeroing without reading GPU scalars.",
 )
 
 

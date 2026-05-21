@@ -26,17 +26,16 @@ pyproject.toml
 │   ├── megatron     megatron-energon
 │   ├── trl          trl
 │   ├── fa4          flash-attn-4, nvidia-cutlass-dsl
-│   ├── transformers5-exp   transformers==5.2.0 (opt-in v5)
 │   └── dev          pre-commit, ruff, pytest (legacy pip compat)
 ├── [dependency-groups]                 Dev-only (uv-native)
 │   ├── dev                  includes lint + test
 │   ├── lint                 pre-commit, ruff
 │   ├── test                 pytest, expecttest, rich
-│   └── transformers-stable  transformers==4.57.3 (default, in default-groups)
+│   └── transformers-stable  transformers==5.2.0 (default, in default-groups)
 ├── [tool.uv]
 │   ├── required-version     Pinned uv version
 │   ├── override-dependencies  Per-extra torch/CUDA pins + cudnn override
-│   ├── conflicts            gpu/npu mutual exclusion + transformers-stable/transformers5-exp
+│   ├── conflicts            gpu/npu/npu_aarch64 mutual exclusion
 │   ├── no-build-isolation-package  flash-attn, flash-attn-3
 │   └── sources              Custom indexes and direct wheel URLs
 └── uv.lock                  Lockfile (committed, used by Docker --locked)
@@ -52,16 +51,13 @@ uv sync --extra npu --dev           # Ascend NPU (x86)
 uv sync --extra npu_aarch64 --dev   # Ascend NPU (ARM)
 ```
 
-## Transformers Version (Dual-Track)
+## Transformers Version
 
-VeOmni supports two mutually exclusive transformers versions via uv conflicts:
-
-| Track | Mechanism | Version | How to activate |
-|-------|-----------|---------|-----------------|
-| **Default (stable)** | Dependency group `transformers-stable` (in `default-groups`) | `4.57.3` | `uv sync --extra gpu --dev` (automatic) |
-| **Experimental (v5)** | Optional extra `transformers5-exp` | `5.2.0` | `uv sync --no-group transformers-stable --extra transformers5-exp --extra gpu --dev` |
-
-`transformers-stable` (group) and `transformers5-exp` (extra) are declared as conflicts in `[tool.uv.conflicts]`. **All new development should target v5.** The v4 stable track will be removed once migration is complete.
+`transformers==5.2.0` is pinned by the `transformers-stable` dependency
+group, which is listed in `[tool.uv] default-groups`. `uv sync` (no extra
+flags) installs it automatically. We keep the version out of
+`[project.dependencies]` so pip users are not forced into a specific 5.x
+patch release; pip users should `pip install transformers==5.2.0` manually.
 
 ## torch Source Pinning
 
@@ -74,11 +70,8 @@ torch, torchvision, torchaudio use custom sources:
 ## Common Commands
 
 ```bash
-# Initial setup (default transformers 4.57.3)
+# Initial setup (transformers==5.2.0 via the default dependency group)
 uv sync --extra gpu --extra audio --dev
-
-# Switch to transformers 5.2.0 (for new development)
-uv sync --no-group transformers-stable --extra transformers5-exp --extra gpu --dev
 
 # Regenerate lockfile after pyproject.toml changes
 uv lock
@@ -97,4 +90,4 @@ uv sync --locked --all-packages --extra gpu --dev
 3. **flash-attn wheels are torch-version-specific** — bumping torch requires new wheels.
 4. **uv version changes require Docker rebuilds** — update Dockerfiles and release new images.
 5. **`override-dependencies` markers are load-bearing** — the `extra == 'gpu'` guards prevent uv from downloading wrong torch variants.
-6. **`transformers-stable` and `transformers5-exp` are mutually exclusive** — uv conflicts enforce this. Never install both. All new code must work with v5; use `is_transformers_version_greater_or_equal_to()` for v4 compat guards.
+6. **`transformers==5.2.0` is the only supported version** — pinned via the `transformers-stable` default dependency group. New code targets v5 APIs (FSDP2 + patchgen-generated modeling) only.

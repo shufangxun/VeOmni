@@ -18,22 +18,20 @@ Violating any of these causes silent bugs, crashes, or incorrect training result
    - Manual edits are silently overwritten on the next patchgen run.
    - To change generated behavior, edit the patch spec (`patch_spec.py`) or the modeling patch file (`modeling_*_patch.py`).
 
-4. **Transformers version: dual-track (v4.57.3 / v5.2.0), new development targets v5**
-   - VeOmni currently supports two transformers versions via uv conflicts:
-     - **Default**: `transformers==4.57.3` (dependency group `transformers-stable`, active by default)
-     - **Experimental**: `transformers==5.2.0` (optional extra `transformers5-exp`)
-   - Switch: `uv sync --no-group transformers-stable --extra transformers5-exp --extra gpu --dev`
-   - **All new code must target v5 APIs.** v4 compatibility code exists but will be removed.
-   - Version branching uses `is_transformers_version_greater_or_equal_to()` from `veomni/utils/import_utils.py`.
-   - Key v4→v5 API changes:
-     - `AutoModelForVision2Seq` removed → use `AutoModelForImageTextToText`
-     - `no_init_weights` moved from `transformers.modeling_utils` to `transformers.initialization`
-     - Model `__init__.py` files select `generated.patched_modeling_*` (v5) vs upstream + `apply_*_patch()` (v4)
-   - Patchgen regeneration must be done with the target transformers version installed.
+4. **Transformers version: pinned to v5.2.0**
+   - VeOmni installs `transformers==5.2.0` via the `transformers-stable`
+     default dependency group in `pyproject.toml`.
+   - The legacy v4 path was removed; all modeling under
+     `veomni/models/transformers/<m>/` is patchgen-generated.
+   - `is_transformers_version_greater_or_equal_to()` from
+     `veomni/utils/import_utils.py` is retained only for forward-looking
+     gates (e.g. `>= 5.3.0` for newer HF APIs) — do **not** add new
+     `>= 5.0.0` or `>= 5.2.0` branches.
+   - Patchgen regeneration must be done with `transformers==5.2.0` installed.
 
 ## Distributed Training
 
-VeOmni supports FSDP1 and FSDP2, but **FSDP1 is legacy and will be removed**. All new development must use FSDP2.
+VeOmni uses FSDP2 exclusively. FSDP1 has been removed.
 
 Core entry points:
 - `veomni/distributed/parallel_state.py` — `init_parallel_state()`, `ParallelState` dataclass
