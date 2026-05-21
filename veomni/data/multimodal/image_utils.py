@@ -104,6 +104,10 @@ def load_image(image: ImageInput, **kwargs):
         return load_image_from_path(image, **kwargs)
     elif isinstance(image, bytes):
         return load_image_from_bytes(image, **kwargs)
+    elif isinstance(image, Image.Image):
+        return image.convert("RGB")
+    elif isinstance(image, np.ndarray):
+        return Image.fromarray(image).convert("RGB")
     else:
         raise NotImplementedError
 

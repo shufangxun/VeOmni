@@ -73,6 +73,7 @@ class VeomniFlopsCounter:
             # qwen3_vl's vit uses full self attention while qwen2-vl/qwen2.5-vl uses window attention.
             "qwen3_vl": self._estimate_qwen3_vl_flops,
             "qwen3_vl_moe": self._estimate_qwen3_vl_moe_flops,
+            "qwen3_siglip_vlm": self._estimate_qwen3_siglip_vlm_flops,
             "deepseek_v3": self._estimate_deepseek_v3_flops,
             "qwen3_moe": self._estimate_qwen3_moe_flops,
             "llama": self._estimate_llama_flops,
@@ -375,6 +376,75 @@ class VeomniFlopsCounter:
 
         # all_layer & all_token fwd & bwd flops
         flops_all_token = dense_N_flops + attn_qkv_flops + vit_flops
+        flops_achieved = flops_all_token * (1.0 / delta_time) / 1e12
+        return flops_achieved
+
+    def _estimate_qwen3_siglip_vit_flop(self, images_seqlens, config):
+        if config is None:
+            return 0
+        tokens_sum = sum(images_seqlens)
+        hidden_size = config.hidden_size
+        intermediate_size = config.intermediate_size
+        num_hidden_layers = config.num_hidden_layers
+        num_attention_heads = config.num_attention_heads
+        head_dim = hidden_size // num_attention_heads
+
+        patch_embed_N = hidden_size * config.num_channels * config.patch_size * config.patch_size
+        mlp_N = hidden_size * intermediate_size * 2
+        attn_linear_N = hidden_size * (4 * hidden_size)
+        dense_N = patch_embed_N + (mlp_N + attn_linear_N) * num_hidden_layers
+        dense_N_flops = 6 * dense_N * tokens_sum
+
+        seqlen_square_sum = 0
+        for seqlen in images_seqlens:
+            seqlen_square_sum += seqlen * seqlen
+        attn_qkv_flops = 12 * seqlen_square_sum * head_dim * num_attention_heads * num_hidden_layers
+        return dense_N_flops + attn_qkv_flops
+
+    def _estimate_qwen3_siglip_vlm_flops(self, tokens_sum, batch_seqlens, delta_time, **kargs):
+        text_config = self.config.text_config
+        hidden_size = text_config.hidden_size
+        vocab_size = text_config.vocab_size
+        num_hidden_layers = text_config.num_hidden_layers
+        num_key_value_heads = text_config.num_key_value_heads
+        num_attention_heads = text_config.num_attention_heads
+        intermediate_size = text_config.intermediate_size
+
+        head_dim = hidden_size // num_attention_heads
+        q_size = num_attention_heads * head_dim
+        k_size = num_key_value_heads * head_dim
+        v_size = num_key_value_heads * head_dim
+
+        mlp_N = hidden_size * intermediate_size * 3
+        attn_linear_N = hidden_size * (q_size + k_size + v_size + num_attention_heads * head_dim)
+        lm_head_N = self._compute_lm_head_params(hidden_size, vocab_size)
+        dense_N = (mlp_N + attn_linear_N) * num_hidden_layers + lm_head_N
+        dense_N_flops = 6 * dense_N * tokens_sum
+
+        seqlen_square_sum = 0
+        for seqlen in batch_seqlens:
+            seqlen_square_sum += seqlen * seqlen
+        attn_qkv_flops = 12 * seqlen_square_sum * head_dim * num_attention_heads * num_hidden_layers
+
+        images_seqlens = kargs.get("images_seqlens", None)
+        if images_seqlens is not None:
+            vit_flops = self._estimate_qwen3_siglip_vit_flop(images_seqlens, self.config.vision_config)
+        else:
+            vit_flops = 0
+
+        connector_flops = 0
+        if images_seqlens is not None:
+            pixel_shuffle_factor = getattr(self.config, "pixel_shuffle_factor", 2)
+            pixel_shuffle_area = pixel_shuffle_factor * pixel_shuffle_factor
+            connector_tokens = sum(
+                (seqlen + pixel_shuffle_area - 1) // pixel_shuffle_area for seqlen in images_seqlens
+            )
+            vision_hidden_size = self.config.vision_config.hidden_size
+            connector_in_size = vision_hidden_size * pixel_shuffle_area
+            connector_N = connector_in_size * hidden_size + hidden_size * hidden_size
+            connector_flops = 6 * connector_N * connector_tokens
+
+        flops_all_token = dense_N_flops + attn_qkv_flops + vit_flops + connector_flops
         flops_achieved = flops_all_token * (1.0 / delta_time) / 1e12
         return flops_achieved
 

@@ -3,7 +3,7 @@ model:
 
 data:
   train_path: configs/multimodal/data/tulu_sharegpt4v_llavavideo_voiceassistant.yaml
-  data_type: conversation
+  data_type: qwen2_5_omni
   max_seq_len: 8196
   train_size: 80000000
   dataloader:

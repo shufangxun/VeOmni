@@ -1,0 +1,37 @@
+sources:
+- /root/shufangxun/data/pt/multimodal/caption/llava-ov-mid-train
+- /root/shufangxun/data/pt/multimodal/interleaved/omnicorpus
+- /root/shufangxun/data/sft/multimodal/llava-next
+
+names:
+- llava_ov_mid_caption
+- omnicorpus_interleaved
+- llava_next_qa
+
+preprocess:
+- interleaved
+- interleaved
+- conversation
+
+text_keys:
+- texts
+- texts
+- conversations
+
+image_keys:
+- images
+- images
+- image
+
+domains:
+- caption
+- interleaved
+- qa
+
+schedule:
+- schedule_type: const
+  weights: [0.34, 0.33, 0.33]
+
+level: token
+stopping_strategy: never_exhausted
+upstream_sharded: true

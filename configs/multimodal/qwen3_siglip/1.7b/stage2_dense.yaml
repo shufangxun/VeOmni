@@ -1,0 +1,70 @@
+model:
+  config_path: /tmp/qwen3_siglip_hf_eval/global_step_100
+  model_path: /tmp/qwen3_siglip_hf_eval/global_step_100
+  tokenizer_path: /tmp/qwen3_siglip_hf_eval/global_step_100
+  ops_implementation:
+    attn_implementation: flash_attention_2
+
+data:
+  train_path: configs/multimodal/data/qwen3_siglip_stage2_dense.yaml
+  multisource_datasets_type: veomni_weighted_multisource
+  datasets_type: iterable
+  data_type: qwen3_siglip_vlm
+  chat_template: siglip_qwen3
+  max_seq_len: 2048
+  train_size: 100000000
+  dataloader:
+    type: native
+    drop_last: true
+    num_workers: 1
+  dyn_bsz_buffer_size: 100
+  mm_configs:
+    patch_size: 14
+    pixel_shuffle_factor: 2
+    image_max_pixels: 200704
+    image_min_pixels: 3136
+    max_ratio: 200
+
+train:
+  accelerator:
+    ulysses_size: 1
+    fsdp_config:
+      fsdp_mode: fsdp2
+      full_shard: true
+      offload: false
+      mixed_precision:
+        enable: true
+    offload_config:
+      enable_activation: false
+  gradient_checkpointing:
+    enable: true
+  global_batch_size: 16
+  micro_batch_size: 1
+  log_train_source_loss_steps: 5
+  log_train_domain_loss_steps: 5
+  bsz_warmup_ratio: 0.01
+  optimizer:
+    type: adamw
+    lr: 1.0e-5
+    lr_warmup_ratio: 0.01
+    lr_decay_style: cosine
+    weight_decay: 0.01
+    max_grad_norm: 1.0
+  vit_lr: 1.0e-6
+  connector_lr: 2.0e-5
+  llm_lr: 1.0e-5
+  freeze_vit: false
+  freeze_connector: false
+  freeze_llm: false
+  init_device: meta
+  enable_full_determinism: false
+  empty_cache_steps: 500
+  checkpoint:
+    output_dir: exp/qwen3-siglip-1.7b-stage2-dense
+    manager: dcp
+    save_steps: 200
+    save_hf_weights: true
+  wandb:
+    enable: true
+    project: qwen3-siglip-vlm
+    name: Qwen3-SigLIP-1.7B-stage2-dense

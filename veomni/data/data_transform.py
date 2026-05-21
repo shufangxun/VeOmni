@@ -12,11 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 from functools import partial
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Sequence, Union
 
+import numpy as np
 import torch
 
+from veomni.utils import logging
 from veomni.utils.constants import AUDIO_INPUT_INDEX, IGNORE_INDEX, IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
 from veomni.utils.registry import Registry
@@ -32,6 +35,7 @@ if TYPE_CHECKING:
 
 
 DATA_TRANSFORM_REGISTRY = Registry("DataTransform")
+logger = logging.get_logger(__name__)
 
 
 def build_data_transform(transform_name: str, **kwargs) -> Callable:
@@ -59,6 +63,42 @@ def _get_text_example(example: Dict[str, Any], text_keys: Union[str, List[str]])
                 return example[key]
         raise ValueError(f"None of the keys {text_keys} are found in the example.")
     raise ValueError(f"text_keys must be a string or a list of strings, but got {type(text_keys)}")
+
+
+def _get_optional_example_value(example: Dict[str, Any], keys: Union[str, List[str], None]) -> Any:
+    if keys is None:
+        return None
+    if isinstance(keys, str):
+        return example.get(keys)
+    if isinstance(keys, list):
+        for key in keys:
+            if key in example and example[key] is not None:
+                return example[key]
+        return None
+    raise ValueError(f"keys must be a string, a list of strings, or None, but got {type(keys)}")
+
+
+def _count_image_placeholders(conversations: Sequence[Any]) -> int:
+    count = 0
+    for message in conversations:
+        if isinstance(message, dict) and message.get("type") == "interleaved":
+            values = message.get("values", [])
+        else:
+            values = message[1:]
+        count += sum(1 for value in values if value[0] == "image")
+    return count
+
+
+def _validate_image_placeholder_alignment(
+    preprocess: str,
+    placeholder_count: int,
+    loaded_image_count: int,
+) -> None:
+    if placeholder_count != loaded_image_count:
+        raise ValueError(
+            f"Image placeholder count mismatch for preprocess={preprocess}: "
+            f"placeholders={placeholder_count}, loaded_images={loaded_image_count}."
+        )
 
 
 @DATA_TRANSFORM_REGISTRY.register("plaintext")
@@ -439,6 +479,242 @@ def process_sample_qwen_vl(
         use_mm_token_type_ids=_is_transformers_v5,
         **kwargs,
     )
+
+
+def _normalize_image_item(image: Any) -> Any:
+    if isinstance(image, dict):
+        if image.get("bytes") is not None:
+            return image["bytes"]
+        if image.get("path") is not None:
+            return image["path"]
+    return image
+
+
+def _extract_image_items(sample: Dict[str, Any], image_keys: Union[str, List[str], None] = None) -> List[Any]:
+    images = _get_optional_example_value(sample, image_keys)
+    if images is None:
+        images = sample.get("images", sample.get("image"))
+    if images is None:
+        return []
+    if isinstance(images, list):
+        return [_normalize_image_item(image) for image in images if image is not None]
+    return [_normalize_image_item(images)]
+
+
+def _sharegpt_conversation_to_multimodal_conversation(conversations: Any) -> List[List[Any]]:
+    if isinstance(conversations, str):
+        conversations = json.loads(conversations)
+    if not conversations:
+        raise ValueError("qwen3_siglip_vlm conversation expects non-empty ShareGPT conversations.")
+
+    role_mapping = {"human": "user", "gpt": "assistant"}
+    if conversations[0].get("from") != "human":
+        conversations = conversations[1:]
+    if not conversations or conversations[0].get("from") != "human":
+        raise ValueError("qwen3_siglip_vlm conversation expects the first ShareGPT turn to be from human.")
+
+    constructed = []
+    for message in conversations:
+        role = role_mapping.get(message.get("from"))
+        if role is None:
+            raise ValueError(f"Unsupported ShareGPT role for qwen3_siglip_vlm conversation: {message.get('from')}")
+        value = message.get("value", "")
+        if "<image>" in value:
+            value = value.replace("<image>", "")
+            constructed.append([role, ("image", None), ("text", value)])
+        else:
+            constructed.append([role, ("text", value)])
+    return constructed
+
+
+def _as_aligned_list(value: Any, field_name: str) -> List[Any]:
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    raise ValueError(f"qwen3_siglip_vlm interleaved expects {field_name} to be an aligned list.")
+
+
+def _build_qwen3_siglip_interleaved_from_aligned_lists(
+    sample: Dict[str, Any],
+    text_keys: Union[str, List[str], None],
+    image_keys: Union[str, List[str], None],
+) -> tuple[List[Dict[str, Any]], List[Any]]:
+    texts = _as_aligned_list(_get_text_example(sample, text_keys or "texts"), "texts")
+    images = _get_optional_example_value(sample, image_keys)
+    if images is None:
+        images = sample.get("images", sample.get("image"))
+    images = _as_aligned_list(images, "images")
+    if len(images) != len(texts):
+        raise ValueError(
+            f"qwen3_siglip_vlm interleaved expects aligned images/texts lists with equal length, "
+            f"but got images={len(images)}, texts={len(texts)}."
+        )
+
+    values, image_items = [], []
+    for index, (image, text) in enumerate(zip(images, texts)):
+        has_image = image is not None
+        has_text = text is not None
+        if has_image == has_text:
+            raise ValueError(
+                "qwen3_siglip_vlm interleaved expects exactly one of images[i] or texts[i] to be non-null "
+                f"at each aligned position, but got images[{index}]={image is not None}, "
+                f"texts[{index}]={text is not None}."
+            )
+        if has_image:
+            values.append(("image", None))
+            image_items.append(_normalize_image_item(image))
+        else:
+            if not isinstance(text, str):
+                raise ValueError(f"qwen3_siglip_vlm interleaved expects text items to be strings, got {type(text)}.")
+            values.append(("text", text))
+
+    return [{"type": "interleaved", "values": values}], image_items
+
+
+def _siglip_patchify_images(
+    images: List[Any],
+    patch_size: int,
+    pixel_shuffle_factor: int,
+    image_mean: Sequence[float] = (0.5, 0.5, 0.5),
+    image_std: Sequence[float] = (0.5, 0.5, 0.5),
+    **kwargs,
+) -> Dict[str, torch.Tensor]:
+    from .multimodal.image_utils import fetch_images
+
+    if not images:
+        return {}
+
+    scale_factor = patch_size * pixel_shuffle_factor
+    pil_images = fetch_images(images, scale_factor=scale_factor, **kwargs)
+    pixel_values, image_grid_hw = [], []
+    mean = torch.tensor(image_mean, dtype=torch.float32).view(3, 1, 1)
+    std = torch.tensor(image_std, dtype=torch.float32).view(3, 1, 1)
+    for image in pil_images:
+        array = np.asarray(image, dtype=np.float32) / 255.0
+        tensor = torch.from_numpy(array).permute(2, 0, 1)
+        tensor = (tensor - mean) / std
+        patches = tensor.unfold(1, patch_size, patch_size).unfold(2, patch_size, patch_size)
+        grid_h, grid_w = patches.shape[1], patches.shape[2]
+        patches = patches.permute(1, 2, 0, 3, 4).reshape(grid_h * grid_w, -1)
+        pixel_values.append(patches)
+        image_grid_hw.append([grid_h, grid_w])
+
+    return {
+        "pixel_values": torch.cat(pixel_values, dim=0),
+        "image_grid_hw": torch.tensor(image_grid_hw, dtype=torch.long),
+    }
+
+
+@DATA_TRANSFORM_REGISTRY.register("qwen3_siglip_vlm")
+def process_sample_qwen3_siglip_vlm(
+    sample: Dict[str, Any],
+    processor: "ProcessorMixin",
+    chat_template: "ChatTemplate",
+    position_id_func: "Callable",
+    max_seq_len: int,
+    text_keys: Union[str, List[str], None] = None,
+    image_keys: Union[str, List[str], None] = None,
+    preprocess: str = None,
+    domain: str = None,
+    patch_size: int = 14,
+    pixel_shuffle_factor: int = 2,
+    **kwargs,
+):
+    del processor
+    if preprocess is None:
+        raise ValueError("qwen3_siglip_vlm requires per-source preprocess from multisource data yaml.")
+
+    image_items = []
+    if preprocess == "plaintext":
+        text_example = _get_text_example(sample, text_keys or "text")
+        tokenized_examples = chat_template.encode_pretrain_text(text_example, max_seq_len=max_seq_len)
+    elif preprocess == "conversation":
+        raw_conversations = _get_text_example(sample, text_keys or "conversations")
+        conversations = _sharegpt_conversation_to_multimodal_conversation(raw_conversations)
+        image_items = _extract_image_items(sample, image_keys)
+        _validate_image_placeholder_alignment(
+            preprocess=preprocess,
+            placeholder_count=_count_image_placeholders(conversations),
+            loaded_image_count=len(image_items),
+        )
+    elif preprocess == "interleaved":
+        conversations, image_items = _build_qwen3_siglip_interleaved_from_aligned_lists(
+            sample,
+            text_keys,
+            image_keys,
+        )
+        _validate_image_placeholder_alignment(
+            preprocess=preprocess,
+            placeholder_count=_count_image_placeholders(conversations),
+            loaded_image_count=len(image_items),
+        )
+    else:
+        raise ValueError(
+            f"Unsupported qwen3_siglip_vlm preprocess: {preprocess}. Supported values are: "
+            "plaintext, conversation, interleaved."
+        )
+
+    try:
+        image_inputs = _siglip_patchify_images(
+            image_items,
+            patch_size=patch_size,
+            pixel_shuffle_factor=pixel_shuffle_factor,
+            **kwargs,
+        )
+    except OSError as exc:
+        logger.warning(
+            "Skip qwen3_siglip_vlm sample with unreadable image: "
+            f"id={sample.get('id')}, preprocess={preprocess}, domain={sample.get('domain', domain)}, "
+            f"image_count={len(image_items)}, error={exc}"
+        )
+        return None
+    image_grid_hw = image_inputs.get("image_grid_hw")
+    image_token_nums = []
+    if image_grid_hw is not None:
+        image_token_nums = [
+            int(
+                ((grid_hw[0].item() + pixel_shuffle_factor - 1) // pixel_shuffle_factor)
+                * ((grid_hw[1].item() + pixel_shuffle_factor - 1) // pixel_shuffle_factor)
+            )
+            for grid_hw in image_grid_hw
+        ]
+
+    if preprocess == "conversation":
+        tokenized_examples = [
+            chat_template.encode_messages(conversations, {"image": image_token_nums}, max_seq_len=max_seq_len)
+        ]
+    elif preprocess == "interleaved":
+        tokenized_examples = [
+            chat_template.encode_interleaved_messages(
+                conversations,
+                {"image": image_token_nums},
+                max_seq_len=max_seq_len,
+            )
+        ]
+
+    domain_name = sample.get("domain_name", sample.get("domain", domain))
+    examples = []
+    for tokenized_example in tokenized_examples:
+        processed_example = {
+            k: (v if isinstance(v, torch.Tensor) else torch.tensor(v)) for k, v in tokenized_example.items()
+        }
+        input_ids = processed_example["input_ids"]
+        attention_mask = processed_example["attention_mask"]
+        image_mask = input_ids == IMAGE_INPUT_INDEX
+        processed_example["image_mask"] = image_mask
+        processed_example["input_ids"] = input_ids.clone()
+        processed_example["input_ids"][image_mask] = 0
+        processed_example["position_ids"] = position_id_func(
+            input_ids=processed_example["input_ids"].unsqueeze(0),
+            attention_mask=attention_mask.unsqueeze(0),
+        )["position_ids"].squeeze(0)
+        if image_inputs:
+            processed_example.update(image_inputs)
+        if domain_name is not None:
+            processed_example["domain_name"] = str(domain_name)
+        examples.append(processed_example)
+    return examples
 
 
 @DATA_TRANSFORM_REGISTRY.register("qwen2_5_omni")

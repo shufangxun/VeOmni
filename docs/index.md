@@ -30,6 +30,7 @@ usage/basic_modules.md
 usage/multimodal_data_processing.md
 usage/data_packing_and_dyn_bsz.md
 usage/support_new_models/guide_and_checklist.md
+usage/support_new_models/v5_llm_vlm_training.md
 usage/support_new_models/qwen3_vl_example.md
 usage/support_new_models/qwen3_omni_moe_example.md
 usage/support_new_models/dit_model_guide.md
@@ -53,6 +54,7 @@ examples/qwen3.md
 examples/qwen3_5.md
 examples/qwen3_moe.md
 examples/qwen3_vl.md
+examples/qwen3_siglip_vlm.md
 examples/qwen3_omni_moe.md
 examples/wan2.1.md
 examples/qwen3_dpo.md
@@ -64,6 +66,7 @@ examples/qwen3_dpo.md
 
 key_features/model_loader.md
 key_features/preprocessor_registry.md
+key_features/qwen3_siglip_vlm_data_format.md
 key_features/ep_fsdp2.md
 key_features/ulysses.md
 key_features/lora.md

@@ -1,10 +1,18 @@
 sources:
-- /root/shufangxun/data/pt/splits/qwen3_1p7b_pretrain_smallval_domain/train/fineweb_sample_10bt
-- /root/shufangxun/data/pt/splits/qwen3_1p7b_pretrain_smallval_domain/train/finewiki_en
+- /root/shufangxun/data/pt/text/splits/qwen3_1p7b_pretrain_smallval_domain/train/fineweb_sample_10bt
+- /root/shufangxun/data/pt/text/splits/qwen3_1p7b_pretrain_smallval_domain/train/finewiki_en
 
 names:
 - fineweb_sample_10bt
 - finewiki_en
+
+preprocess:
+- plaintext
+- plaintext
+
+text_keys:
+- text
+- text
 
 schedule:
 - schedule_type: const

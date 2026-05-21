@@ -364,8 +364,8 @@ class TextTrainer:
             self._build_train_group_metrics(
                 train_source_stats,
                 train_source_aggregation_time,
-                "training/source",
-                "training/source_loss/aggregation_time_ms",
+                "source_loss",
+                "source_loss/aggregation_time_ms",
                 ordered_group_names=list(self.train_source_names),
             )
             if log_train_source_loss
@@ -376,8 +376,8 @@ class TextTrainer:
                 self._build_train_group_metrics(
                     train_domain_stats,
                     train_domain_aggregation_time,
-                    "training/domain",
-                    "training/domain_loss/aggregation_time_ms",
+                    "domain_loss",
+                    "domain_loss/aggregation_time_ms",
                 )
             )
         self.on_step_end(loss=total_loss, loss_dict=total_loss_dict, grad_norm=grad_norm)

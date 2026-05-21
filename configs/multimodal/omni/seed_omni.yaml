@@ -12,7 +12,7 @@ data:
     type: native
   datasets_type: iterable
   train_path: sharegpt4v_pretrain
-  data_type: conversation
+  data_type: qwen2_vl
   chat_template: qwen2vl
   max_seq_len: 8192
 

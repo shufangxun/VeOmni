@@ -9,8 +9,10 @@ pytest.importorskip("transformers")
 
 from veomni.data.data_transform import process_conversation_example, process_plaintext_example  # noqa: E402
 from veomni.trainer import text_trainer as text_trainer_module  # noqa: E402
+from veomni.trainer import vlm_trainer as vlm_trainer_module  # noqa: E402
 from veomni.trainer.callbacks.evaluate_callback import EvaluateCallback  # noqa: E402
 from veomni.trainer.text_trainer import TextTrainer  # noqa: E402
+from veomni.trainer.vlm_trainer import VLMTrainer  # noqa: E402
 
 
 class DummyTokenizer:
@@ -35,6 +37,12 @@ class DummyChatTemplate:
 def _trainer() -> TextTrainer:
     trainer = TextTrainer.__new__(TextTrainer)
     trainer.train_source_names = ["fineweb", "finewiki"]
+    return trainer
+
+
+def _vlm_trainer() -> VLMTrainer:
+    trainer = VLMTrainer.__new__(VLMTrainer)
+    trainer.train_source_names = ["caption", "interleaved", "qa"]
     return trainer
 
 
@@ -115,14 +123,14 @@ def test_text_trainer_accumulates_domain_loss(monkeypatch):
     metrics = trainer._build_train_group_metrics(
         stats,
         aggregation_time=0.001,
-        metric_prefix="training/domain",
-        aggregation_metric_name="training/domain_loss/aggregation_time_ms",
+        metric_prefix="domain_loss",
+        aggregation_metric_name="domain_loss/aggregation_time_ms",
     )
 
-    assert metrics["training/domain/web/loss"] == pytest.approx(1.5)
-    assert metrics["training/domain/web/tokens"] == 2
-    assert metrics["training/domain/knowledge/loss"] == pytest.approx(3.5)
-    assert metrics["training/domain/knowledge/tokens"] == 2
+    assert metrics["domain_loss/web/loss"] == pytest.approx(1.5)
+    assert metrics["domain_loss/web/tokens"] == 2
+    assert metrics["domain_loss/knowledge/loss"] == pytest.approx(3.5)
+    assert metrics["domain_loss/knowledge/tokens"] == 2
 
 
 def test_text_trainer_gathers_domain_names_before_reducing(monkeypatch):
@@ -160,13 +168,13 @@ def test_text_trainer_gathers_domain_names_before_reducing(monkeypatch):
     metrics = trainer._build_train_group_metrics(
         stats,
         aggregation_time=0.001,
-        metric_prefix="training/domain",
-        aggregation_metric_name="training/domain_loss/aggregation_time_ms",
+        metric_prefix="domain_loss",
+        aggregation_metric_name="domain_loss/aggregation_time_ms",
     )
 
     assert reduce_calls == [(0.0, 0.0), (3.0, 2.0), 0.001]
-    assert "training/domain/sft/loss" not in metrics
-    assert metrics["training/domain/web/loss"] == pytest.approx(1.5)
+    assert "domain_loss/sft/loss" not in metrics
+    assert metrics["domain_loss/web/loss"] == pytest.approx(1.5)
 
 
 def test_text_trainer_skips_missing_domain_metadata():
@@ -211,3 +219,49 @@ def test_evaluate_callback_accumulates_domain_loss(monkeypatch):
     assert stats["web"]["tokens"] == 2
     assert stats["knowledge"]["loss_sum"] == pytest.approx(7.0)
     assert stats["knowledge"]["tokens"] == 2
+
+
+def test_vlm_trainer_accumulates_source_and_domain_loss(monkeypatch):
+    monkeypatch.setattr(
+        vlm_trainer_module,
+        "get_parallel_state",
+        lambda: types.SimpleNamespace(dp_group=None, sp_enabled=False),
+    )
+    monkeypatch.setattr(vlm_trainer_module, "all_reduce", lambda value, op="sum", group=None: value)
+
+    trainer = _vlm_trainer()
+    micro_batch = {
+        "position_ids": torch.tensor([[0, 1, 0, 1, 2, 0, 1]], dtype=torch.long),
+        "source_name": ["caption", "interleaved", "qa"],
+        "domain_name": ["caption", "interleaved", "qa"],
+    }
+    metadata = trainer._snapshot_train_loss_metadata([micro_batch], include_source=True, include_domain=True)[0]
+
+    source_stats = _loss_stats()
+    domain_stats = _loss_stats()
+    log_probs = torch.tensor([-1.0, -2.0, -3.0, -4.0, 0.0, -5.0, -6.0])
+    trainer._accumulate_train_group_loss(source_stats, metadata, "source_names", log_probs)
+    trainer._accumulate_train_group_loss(domain_stats, metadata, "domain_names", log_probs)
+
+    source_metrics = trainer._build_train_group_metrics(
+        source_stats,
+        aggregation_time=0.001,
+        metric_prefix="source_loss",
+        aggregation_metric_name="source_loss/aggregation_time_ms",
+        ordered_group_names=list(trainer.train_source_names),
+    )
+    domain_metrics = trainer._build_train_group_metrics(
+        domain_stats,
+        aggregation_time=0.002,
+        metric_prefix="domain_loss",
+        aggregation_metric_name="domain_loss/aggregation_time_ms",
+    )
+
+    assert source_metrics["source_loss/caption/loss"] == pytest.approx(1.5)
+    assert source_metrics["source_loss/interleaved/loss"] == pytest.approx(3.5)
+    assert source_metrics["source_loss/qa/loss"] == pytest.approx(5.5)
+    assert domain_metrics["domain_loss/caption/loss"] == pytest.approx(1.5)
+    assert domain_metrics["domain_loss/interleaved/loss"] == pytest.approx(3.5)
+    assert domain_metrics["domain_loss/qa/loss"] == pytest.approx(5.5)
+    assert "source_loss/caption/ppl" in source_metrics
+    assert "domain_loss/qa/ppl" in domain_metrics

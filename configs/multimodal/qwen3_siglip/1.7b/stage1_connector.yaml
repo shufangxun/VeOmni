@@ -1,23 +1,29 @@
 model:
-  model_path: Qwen/Qwen3-1.7B-Base
+  config_path: /root/shufangxun/checkpoints/qwen3_siglip_1p7b_init
+  model_path: /root/shufangxun/checkpoints/qwen3_siglip_1p7b_init
+  tokenizer_path: Qwen/Qwen3-1.7B-Base
   ops_implementation:
     attn_implementation: flash_attention_2
 
 data:
-  train_path: configs/text/data/tulu_sft.yaml
-  eval_path: configs/text/data/tulu_sft_val.yaml
+  train_path: configs/multimodal/data/qwen3_siglip_stage1_connector.yaml
   multisource_datasets_type: veomni_weighted_multisource
-  data_type: conversation
-  chat_template: chatml
   datasets_type: iterable
-  max_seq_len: 4096
-  train_size: 750000000
-  text_keys: messages
-  dyn_bsz_buffer_size: 200
+  data_type: qwen3_siglip_vlm
+  chat_template: siglip_qwen3
+  max_seq_len: 2048
+  train_size: 100000000
   dataloader:
     type: native
     drop_last: true
     num_workers: 1
+  dyn_bsz_buffer_size: 100
+  mm_configs:
+    patch_size: 14
+    pixel_shuffle_factor: 2
+    image_max_pixels: 200704
+    image_min_pixels: 3136
+    max_ratio: 200
 
 train:
   accelerator:
@@ -34,31 +40,31 @@ train:
     enable: true
   global_batch_size: 32
   micro_batch_size: 1
-  eval_global_batch_size: 16
-  eval_micro_batch_size: 4
-  eval_dataloader_num_workers: 1
   log_train_source_loss_steps: 5
   log_train_domain_loss_steps: 5
-  bsz_warmup_ratio: 0.007
-  eval_steps: 5
-  eval_epochs: 0
+  bsz_warmup_ratio: 0.01
   optimizer:
     type: adamw
     lr: 1.0e-4
-    lr_warmup_ratio: 0.007
+    lr_warmup_ratio: 0.01
     lr_decay_style: cosine
     weight_decay: 0.01
     max_grad_norm: 1.0
-  num_train_epochs: 1
+  vit_lr: 0.0
+  connector_lr: 1.0e-4
+  llm_lr: 0.0
+  freeze_vit: true
+  freeze_connector: false
+  freeze_llm: true
   init_device: meta
   enable_full_determinism: false
   empty_cache_steps: 500
   checkpoint:
-    output_dir: exp/qwen3-1.7b-tulu-sft
+    output_dir: exp/qwen3-siglip-1.7b-stage1-connector
     manager: dcp
-    save_steps: 0
-    save_hf_weights: false
+    save_steps: 5
+    save_hf_weights: true
   wandb:
     enable: true
-    project: qwen3-sft
-    name: Qwen3-1.7B-Tulu-SFT
+    project: qwen3-siglip-vlm
+    name: Qwen3-SigLIP-1.7B-stage1-connector

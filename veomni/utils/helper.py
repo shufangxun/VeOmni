@@ -110,6 +110,10 @@ def _compute_image_seqlens(micro_batch: Dict[str, "torch.Tensor"]) -> List[int]:
             grid_thw = micro_batch[key]
             seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).tolist()
             image_seqlens.extend(seqlens)
+    if "image_grid_hw" in micro_batch:
+        grid_hw = micro_batch["image_grid_hw"]
+        seqlens = (grid_hw[:, 0] * grid_hw[:, 1]).tolist()
+        image_seqlens.extend(seqlens)
     return image_seqlens
 
 
@@ -246,6 +250,8 @@ class EnvironMeter:
         avg_effective_len = batch_tokens / self.global_batch_size if self.global_batch_size else 0
         avg_sample_seq_len = batch_tokens / real_global_batch_size if real_global_batch_size else 0
         tokens_per_second = batch_tokens / delta_time
+        tokens_per_second_per_gpu = tokens_per_second / self.world_size if self.world_size else 0
+        samples_per_second_per_gpu = real_global_batch_size / delta_time / self.world_size if self.world_size else 0
         self.consume_tokens += batch_tokens
         self.consume_chunks += real_global_batch_size
 
@@ -261,11 +267,10 @@ class EnvironMeter:
         cpu_memory_info = psutil.virtual_memory()
 
         metrics = {
+            # Legacy top-level keys kept for compatibility with existing tests and scripts.
             "flops_achieved(T)": flops_achieved,
             "flops_promised(T)": flops_promised,
             "mfu": mfu,
-            "training/avg_effective_len": avg_effective_len,
-            "training/avg_sample_seq_len": avg_sample_seq_len,
             "tokens_per_second(M)": tokens_per_second / 1e6,
             "consume_tokens(M)": self.consume_tokens / 1e6,
             "consume_tokens(B)": self.consume_tokens / 1e9,
@@ -276,6 +281,24 @@ class EnvironMeter:
             "cpu_available_memory(GB)": cpu_memory_info.available / (1024**3),
             "cpu_memory_usage(%)": cpu_memory_info.percent,
             "num_alloc_retries": num_alloc_retries,
+            # Namespaced keys make W&B split metrics into separate panels.
+            "perf/flops_achieved_T": flops_achieved,
+            "perf/flops_promised_T": flops_promised,
+            "perf/mfu": mfu,
+            "perf/tokens_per_second_M": tokens_per_second / 1e6,
+            "perf/tokens_per_second_per_gpu_M": tokens_per_second_per_gpu / 1e6,
+            "perf/samples_per_second_per_gpu": samples_per_second_per_gpu,
+            "data/avg_effective_len": avg_effective_len,
+            "data/avg_sample_seq_len": avg_sample_seq_len,
+            "data/consume_tokens_M": self.consume_tokens / 1e6,
+            "data/consume_tokens_B": self.consume_tokens / 1e9,
+            "data/consumed_chunk_num": self.consume_chunks,
+            "memory/max_allocated_GB": allocated_memory / (1024**3),
+            "memory/max_reserved_GB": reserved_memory / (1024**3),
+            "memory/cpu_used_GB": cpu_memory_info.used / (1024**3),
+            "memory/cpu_available_GB": cpu_memory_info.available / (1024**3),
+            "memory/cpu_usage_percent": cpu_memory_info.percent,
+            "memory/num_alloc_retries": num_alloc_retries,
         }
 
         if self.enable_multisource:

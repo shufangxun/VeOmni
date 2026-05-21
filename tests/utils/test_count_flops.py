@@ -18,8 +18,10 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
+import torch
 
 from veomni.utils.count_flops import VeomniFlopsCounter
+from veomni.utils.helper import _compute_image_seqlens
 
 
 def _to_namespace(value):
@@ -50,6 +52,33 @@ def qwen3_5_counter():
 @pytest.fixture
 def qwen3_5_moe_counter():
     config = _load_toy_config("tests/toy_config/qwen3_5_moe_toy")
+    return VeomniFlopsCounter(config)
+
+
+@pytest.fixture
+def qwen3_siglip_vlm_counter():
+    config = _to_namespace(
+        {
+            "model_type": "qwen3_siglip_vlm",
+            "pixel_shuffle_factor": 2,
+            "text_config": {
+                "hidden_size": 128,
+                "vocab_size": 1024,
+                "num_hidden_layers": 2,
+                "num_key_value_heads": 2,
+                "num_attention_heads": 4,
+                "intermediate_size": 256,
+            },
+            "vision_config": {
+                "hidden_size": 64,
+                "intermediate_size": 128,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 4,
+                "num_channels": 3,
+                "patch_size": 14,
+            },
+        }
+    )
     return VeomniFlopsCounter(config)
 
 
@@ -101,3 +130,22 @@ class TestQwen35MoeFlops:
         flops, _ = qwen3_5_moe_counter.estimate_flops(batch_seqlens, delta_time=1.0, images_seqlens=[256, 512])
         # Embedding lookup is not a matmul; only lm_head contributes vocab_size * hidden_size.
         assert flops == pytest.approx(18.847925010432, rel=1e-9)
+
+
+class TestQwen3SiglipVLMFlops:
+    def test_text_only(self, qwen3_siglip_vlm_counter):
+        flops, promised = qwen3_siglip_vlm_counter.estimate_flops([128, 256], delta_time=1.0)
+        assert promised == 1000.0
+        assert flops > 0
+
+    def test_with_vit(self, qwen3_siglip_vlm_counter):
+        batch_seqlens = [128, 256]
+        text_flops, _ = qwen3_siglip_vlm_counter.estimate_flops(batch_seqlens, delta_time=1.0)
+        vlm_flops, _ = qwen3_siglip_vlm_counter.estimate_flops(
+            batch_seqlens, delta_time=1.0, images_seqlens=[256, 484]
+        )
+        assert vlm_flops > text_flops
+
+    def test_siglip_image_grid_hw_seqlens(self):
+        image_seqlens = _compute_image_seqlens({"image_grid_hw": torch.tensor([[22, 22], [16, 16]])})
+        assert image_seqlens == [484, 256]

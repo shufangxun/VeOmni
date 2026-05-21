@@ -1375,6 +1375,8 @@ def build_weighted_multisource_dataset(
     )  # if source_ids is not provided, use source_names as source_ids
     preprocesses = multisource_config.get("preprocess")
     text_keys_per_source = multisource_config.get("text_keys")
+    image_keys_per_source = multisource_config.get("image_keys")
+    domains_per_source = multisource_config.get("domains")
 
     level = multisource_config.get("level", "sample")
     stopping_strategy = multisource_config.get("stopping_strategy", "first_exhausted")
@@ -1383,7 +1385,12 @@ def build_weighted_multisource_dataset(
     datasets = []
     for idx, source in enumerate(sources):
         source_transform = transform
-        if transform is not None and (preprocesses is not None or text_keys_per_source is not None):
+        if transform is not None and (
+            preprocesses is not None
+            or text_keys_per_source is not None
+            or image_keys_per_source is not None
+            or domains_per_source is not None
+        ):
             source_transform_kwargs = {"ds_idx": idx}
             if source_names is not None:
                 source_transform_kwargs["source_name"] = source_names[idx]
@@ -1391,6 +1398,10 @@ def build_weighted_multisource_dataset(
                 source_transform_kwargs["preprocess"] = preprocesses[idx]
             if text_keys_per_source is not None:
                 source_transform_kwargs["text_keys"] = text_keys_per_source[idx]
+            if image_keys_per_source is not None:
+                source_transform_kwargs["image_keys"] = image_keys_per_source[idx]
+            if domains_per_source is not None:
+                source_transform_kwargs["domain"] = domains_per_source[idx]
             source_transform = partial(transform, **source_transform_kwargs)
 
         datasets.append(

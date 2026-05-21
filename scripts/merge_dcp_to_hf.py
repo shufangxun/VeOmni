@@ -2,6 +2,7 @@ import argparse
 import gc
 import json
 import os
+import shutil
 from collections import OrderedDict
 from typing import TYPE_CHECKING, Optional, Sequence, Union
 
@@ -21,6 +22,59 @@ if TYPE_CHECKING:
 
 
 logger = helper.create_logger(__name__)
+
+
+def _get_qwen3_siglip_chat_template() -> str:
+    return (
+        "{%- if not add_generation_prompt is defined -%}"
+        "{%- set add_generation_prompt = false -%}"
+        "{%- endif -%}"
+        "{%- for message in messages -%}"
+        "{{- '<|im_start|>' + message['role'] + '\n' -}}"
+        "{%- if message['content'] is string -%}"
+        "{{- message['content'] | trim -}}"
+        "{%- else -%}"
+        "{%- for content in message['content'] -%}"
+        "{%- if content['type'] == 'image' or 'image' in content or 'image_url' in content -%}"
+        "{%- if content['image_token_num'] is defined -%}"
+        "{%- set image_token_num = content['image_token_num'] -%}"
+        "{%- elif content['token_num'] is defined -%}"
+        "{%- set image_token_num = content['token_num'] -%}"
+        "{%- elif content['num_tokens'] is defined -%}"
+        "{%- set image_token_num = content['num_tokens'] -%}"
+        "{%- else -%}"
+        "{%- set image_token_num = 1 -%}"
+        "{%- endif -%}"
+        "{{- '<|image_pad|>' * (image_token_num | int) -}}"
+        "{%- elif content['type'] == 'text' or 'text' in content -%}"
+        "{{- content['text'] -}}"
+        "{%- endif -%}"
+        "{%- endfor -%}"
+        "{%- endif -%}"
+        "{{- '<|im_end|>\n' -}}"
+        "{%- endfor -%}"
+        "{%- if add_generation_prompt -%}"
+        "{{- '<|im_start|>assistant\n' -}}"
+        "{%- endif -%}"
+    )
+
+
+def _maybe_write_qwen3_siglip_chat_template(save_path: str) -> None:
+    config_path = os.path.join(save_path, "config.json")
+    if not os.path.exists(config_path):
+        return
+    try:
+        with open(config_path, encoding="utf-8") as f:
+            model_type = json.load(f).get("model_type")
+    except Exception as exc:
+        logger.warning(f"Failed to inspect config for chat template override: {exc}")
+        return
+    if model_type != "qwen3_siglip_vlm":
+        return
+    chat_template_path = os.path.join(save_path, "chat_template.jinja")
+    with open(chat_template_path, "w", encoding="utf-8") as f:
+        f.write(_get_qwen3_siglip_chat_template())
+    logger.info("Wrote canonical qwen3_siglip_vlm chat_template.jinja")
 
 
 @torch.no_grad()
@@ -129,6 +183,31 @@ def merge_to_hf_pt(
             model_assets = None
 
     save_model_weights(save_path, load_dir, shard_size=shard_size, model_assets=model_assets)
+
+    if model_assets_dir is not None:
+        asset_names = (
+            "config.json",
+            "generation_config.json",
+            "preprocessor_config.json",
+            "processor_config.json",
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "special_tokens_map.json",
+            "chat_template.jinja",
+        )
+        os.makedirs(save_path, exist_ok=True)
+        copied = []
+        for asset_name in asset_names:
+            src = os.path.join(model_assets_dir, asset_name)
+            if os.path.exists(src):
+                shutil.copy2(src, os.path.join(save_path, asset_name))
+                copied.append(asset_name)
+        if copied:
+            logger.info(f"Copied raw model asset files: {copied}")
+        else:
+            logger.warning(f"No raw model asset files found in {model_assets_dir}")
+
+    _maybe_write_qwen3_siglip_chat_template(save_path)
 
 
 def main():

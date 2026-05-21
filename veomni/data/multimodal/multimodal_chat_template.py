@@ -969,6 +969,148 @@ class SeedOssPretrainTemplate(LlamaPretrainTemplate):
         self.cfg_ratio = kwargs.get("cfg_ratio", None)
 
 
+class SiglipQwen3ChatTemplate(MultimodalChatTemplate):
+    def __init__(self, tokenizer: PreTrainedTokenizer, **kwargs) -> None:
+        super().__init__(tokenizer)
+        self.image_pad = "<|image_pad|>"
+        if self.tokenizer.convert_tokens_to_ids(self.image_pad) == self.tokenizer.unk_token_id:
+            self.tokenizer.add_special_tokens({"additional_special_tokens": [self.image_pad]})
+        if self.tokenizer.pad_token_id is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+        self.image_token_id = self.tokenizer.convert_tokens_to_ids(self.image_pad)
+        self.eos = self.tokenizer.encode("<|im_end|>\n", add_special_tokens=False)
+
+    def image_pattern(self, token_num: int) -> str:
+        return self.image_pad * int(token_num)
+
+    def get_jinja_template(self) -> str:
+        return (
+            "{%- if not add_generation_prompt is defined -%}"
+            "{%- set add_generation_prompt = false -%}"
+            "{%- endif -%}"
+            "{%- for message in messages -%}"
+            "{{- '<|im_start|>' + message['role'] + '\n' -}}"
+            "{%- if message['content'] is string -%}"
+            "{{- message['content'] | trim -}}"
+            "{%- else -%}"
+            "{%- for content in message['content'] -%}"
+            "{%- if content['type'] == 'image' or 'image' in content or 'image_url' in content -%}"
+            "{%- if content['image_token_num'] is defined -%}"
+            "{%- set image_token_num = content['image_token_num'] -%}"
+            "{%- elif content['token_num'] is defined -%}"
+            "{%- set image_token_num = content['token_num'] -%}"
+            "{%- elif content['num_tokens'] is defined -%}"
+            "{%- set image_token_num = content['num_tokens'] -%}"
+            "{%- else -%}"
+            "{%- set image_token_num = 1 -%}"
+            "{%- endif -%}"
+            "{{- '<|image_pad|>' * (image_token_num | int) -}}"
+            "{%- elif content['type'] == 'text' or 'text' in content -%}"
+            "{{- content['text'] -}}"
+            "{%- endif -%}"
+            "{%- endfor -%}"
+            "{%- endif -%}"
+            "{{- '<|im_end|>\n' -}}"
+            "{%- endfor -%}"
+            "{%- if add_generation_prompt -%}"
+            "{{- '<|im_start|>assistant\n' -}}"
+            "{%- endif -%}"
+        )
+
+    def encode_pretrain_text(self, text: str, max_seq_len: int = 8192) -> List[Dict[str, List[int]]]:
+        input_ids = self.tokenizer.encode(text.strip(), add_special_tokens=False) + [self.tokenizer.eos_token_id]
+        examples = []
+        for start in range(0, len(input_ids), max_seq_len):
+            chunk = input_ids[start : start + max_seq_len]
+            examples.append(
+                {
+                    "input_ids": chunk,
+                    "attention_mask": [1] * len(chunk),
+                    "labels": chunk.copy(),
+                }
+            )
+        return examples
+
+    def encode_interleaved_messages(
+        self,
+        conversations: Sequence[Dict[str, str]],
+        num_tokens: Dict[str, List[int]] = None,
+        max_seq_len: int = 8192,
+        **kwargs,
+    ) -> Dict[str, List[int]]:
+        del max_seq_len, kwargs
+        if num_tokens is None:
+            num_tokens = defaultdict(list)
+        image_token_num_list = iter(num_tokens.get("image", []))
+        content = ""
+        for message in conversations[0]["values"]:
+            if message[0] == "text":
+                content += message[1]
+            elif message[0] == "image":
+                content += self.image_pattern(next(image_token_num_list))
+            else:
+                raise ValueError(f"Unknown value type: {message[0]}")
+
+        input_ids = self.tokenizer.encode(content.strip(), add_special_tokens=False) + [self.tokenizer.eos_token_id]
+        labels = input_ids.copy()
+        tokenized_example = {
+            "input_ids": torch.tensor(input_ids),
+            "attention_mask": torch.tensor([1] * len(input_ids)),
+            "labels": torch.tensor(labels),
+        }
+        image_mask = tokenized_example["input_ids"] == self.image_token_id
+        tokenized_example["input_ids"][image_mask] = TYPE2INDEX["input"]["image"]
+        tokenized_example["labels"][image_mask] = IGNORE_INDEX
+        return tokenized_example
+
+    def encode_messages(
+        self,
+        conversations: Sequence[Dict[str, str]],
+        num_tokens: Dict[str, List[int]] = None,
+        max_seq_len: int = 8192,
+        **kwargs,
+    ) -> Dict[str, List[int]]:
+        del max_seq_len, kwargs
+        if num_tokens is None:
+            num_tokens = defaultdict(list)
+        image_token_num_list = iter(num_tokens.get("image", []))
+        input_ids, attention_mask, labels = [], [], []
+
+        for message in conversations:
+            role = message[0]
+            content = ""
+            for value in message[1:]:
+                if value[0] == "text":
+                    content += value[1]
+                elif value[0] == "image":
+                    content += self.image_pattern(next(image_token_num_list))
+                else:
+                    raise ValueError(f"Unknown value type: {value[0]}")
+
+            prefix_ids = self.tokenizer.encode(f"<|im_start|>{role}\n", add_special_tokens=False)
+            content_ids = self.tokenizer.encode(content.strip(), add_special_tokens=False) if content.strip() else []
+            message_ids = prefix_ids + content_ids
+            if content_ids:
+                message_ids += self.eos
+
+            input_ids += message_ids
+            attention_mask += [1] * len(message_ids)
+            if role == "assistant":
+                labels += [IGNORE_INDEX] * len(prefix_ids) + message_ids[len(prefix_ids) :]
+            else:
+                labels += [IGNORE_INDEX] * len(message_ids)
+
+        tokenized_example = {
+            "input_ids": torch.tensor(input_ids),
+            "attention_mask": torch.tensor(attention_mask),
+            "labels": torch.tensor(labels),
+        }
+        image_mask = tokenized_example["input_ids"] == self.image_token_id
+        tokenized_example["input_ids"][image_mask] = TYPE2INDEX["input"]["image"]
+        tokenized_example["labels"][image_mask] = IGNORE_INDEX
+        return tokenized_example
+
+
 TEMPLATES = {
     "qwen2vl": Qwen2VLChatTemplate,
     "qwen3vl": Qwen3VLChatTemplate,
@@ -979,6 +1121,7 @@ TEMPLATES = {
     "llama": LlamaPretrainTemplate,
     "qwen3moe": Qwen3MoeChatTemplate,
     "seed_oss": SeedOssPretrainTemplate,
+    "siglip_qwen3": SiglipQwen3ChatTemplate,
 }
 
 

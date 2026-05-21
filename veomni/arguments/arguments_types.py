@@ -1057,7 +1057,9 @@ class DataArguments:
             "help": "Number of samples for training to compute training steps for non-dynamic batch dataloader."
         },
     )
-    data_type: Literal["plaintext", "conversation", "mixed_text", "diffusion", "classification", "dpo"] = field(
+    data_type: Literal[
+        "plaintext", "conversation", "mixed_text", "qwen3_siglip_vlm", "diffusion", "classification", "dpo"
+    ] = field(
         default="conversation",
         metadata={"help": "Type of the training data."},
     )
@@ -1109,6 +1111,8 @@ class DataArguments:
             elif self.data_type == "conversation":
                 self.text_keys = "messages"
             elif self.data_type == "mixed_text":
+                pass
+            elif self.data_type == "qwen3_siglip_vlm":
                 pass
             elif self.data_type == "classification":
                 self.text_keys = "text"

@@ -1,6 +1,6 @@
 sources:
-- /root/shufangxun/data/pt/splits/qwen3_1p7b_pretrain_smallval_domain/val/fineweb_sample_10bt_100.parquet
-- /root/shufangxun/data/pt/splits/qwen3_1p7b_pretrain_smallval_domain/val/finewiki_en_100.parquet
+- /root/shufangxun/data/pt/text/splits/qwen3_1p7b_pretrain_smallval_domain/val/fineweb_sample_10bt_100.parquet
+- /root/shufangxun/data/pt/text/splits/qwen3_1p7b_pretrain_smallval_domain/val/finewiki_en_100.parquet
 - /root/shufangxun/data/sft/text/tulu-3-sft-mixture/eval
 
 names:

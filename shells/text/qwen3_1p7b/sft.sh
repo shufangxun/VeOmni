@@ -9,7 +9,7 @@ export PATH="${ROOT_DIR}/.venv/bin:${PATH}"
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 export WANDB_API_KEY=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
 
-CONFIG="${CONFIG:-configs/text/qwen3/1.7b/sft/tulu_sft.yaml}"
+CONFIG="${CONFIG:-configs/text/qwen3/1.7b/tulu_sft.yaml}"
 
 if [[ "${WANDB_MODE:-}" != "disabled" && "${WANDB_DISABLED:-}" != "true" ]] \
   && grep -qE '^[[:space:]]+enable:[[:space:]]+true[[:space:]]*$' "${CONFIG}" \
