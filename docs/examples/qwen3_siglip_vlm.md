@@ -72,9 +72,6 @@ train:
   freeze_vit: true
   freeze_connector: false
   freeze_llm: true
-  vit_lr: 0.0
-  connector_lr: 1.0e-4
-  llm_lr: 0.0
 ```
 
 Smoke run:
@@ -93,7 +90,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 NPROC_PER_NODE=4 \
 
 ## Stage 2: Dense VLM Training
 
-Stage 2 starts from a stage1 HF checkpoint and trains the vision tower, connector, and LLM together with separate learning rates.
+Stage 2 starts from a stage1 HF checkpoint and trains the vision tower, connector, and LLM together with a single optimizer learning rate.
 
 ```shell
 bash shells/multimodal/qwen3siglip/stage2_dense.sh
@@ -117,9 +114,6 @@ train:
   freeze_vit: false
   freeze_connector: false
   freeze_llm: false
-  vit_lr: 1.0e-6
-  connector_lr: 2.0e-5
-  llm_lr: 1.0e-5
 ```
 
 Smoke run:

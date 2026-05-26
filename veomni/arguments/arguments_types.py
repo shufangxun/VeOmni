@@ -545,7 +545,9 @@ class TrainingArguments:
     )
     moe_load_balance_monitor_interval: int = field(
         default=0,
-        metadata={"help": "Log MoE expert load heatmap every N steps. 0 = disabled. Requires wandb.enable=True."},
+        metadata={
+            "help": "Log paper-style training-batch MoE MaxVio every N steps. 0 = disabled. Requires wandb.enable=True."
+        },
     )
 
     # sub-argument groups

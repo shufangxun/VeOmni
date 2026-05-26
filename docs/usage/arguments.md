@@ -229,6 +229,7 @@ NPU validation runs at two times:
 | seed | `int` | `42` | Random seed. |
 | enable_compile | `bool` | `False` | Enable `torch.compile`. |
 | max_steps | `Optional[int]` | `None` | Max training steps per epoch (debug only). |
+| moe_load_balance_monitor_interval | `int` | `0` | Log paper-style training-batch MoE MaxVio every N steps. `0` disables it. Requires W&B. |
 | optimizer | `OptimizerConfig` | — | Optimizer and learning-rate schedule. |
 | wandb | `WandbConfig` | — | Weights & Biases logging. |
 | profile | `ProfileConfig` | — | Torch profiler settings. |

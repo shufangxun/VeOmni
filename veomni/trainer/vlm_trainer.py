@@ -39,6 +39,7 @@ from .base import BaseTrainer, _collect_muon_kwargs
 
 logger = helper.create_logger(__name__)
 MAX_PIXELS = 768 * 28 * 28
+SIGLIP_WRAPPER_MODEL_TYPES = ("qwen3_siglip_vlm", "qwen3_moe_siglip_vlm")
 
 
 def _get_vlm_visual_module(model):
@@ -77,14 +78,6 @@ class VLMTrainingArguments(TrainingArguments):
     freeze_llm: bool = field(
         default=False,
         metadata={"help": "Whether or not to freeze the language model parameters."},
-    )
-    connector_lr: Optional[float] = field(
-        default=None,
-        metadata={"help": "Maximum learning rate for connector parameters."},
-    )
-    llm_lr: Optional[float] = field(
-        default=None,
-        metadata={"help": "Maximum learning rate for language model parameters."},
     )
 
 
@@ -186,7 +179,7 @@ class VLMTrainer:
             self.base.model.disable_talker()
 
         if args.train.freeze_vit:
-            if model_config.model_type == "qwen3_siglip_vlm":
+            if model_config.model_type in SIGLIP_WRAPPER_MODEL_TYPES:
                 self.base.model.vision_tower.requires_grad_(False)
             elif model_config.model_type in ("qwen2_5_omni", "qwen3_omni_moe"):
                 self.base.model.thinker.visual.requires_grad_(False)
@@ -208,7 +201,7 @@ class VLMTrainer:
             )
             audio_proj.requires_grad_(True)
 
-        if model_config.model_type == "qwen3_siglip_vlm":
+        if model_config.model_type in SIGLIP_WRAPPER_MODEL_TYPES:
             if args.train.freeze_connector:
                 self.base.model.connector.requires_grad_(False)
             if args.train.freeze_llm:
@@ -219,7 +212,7 @@ class VLMTrainer:
 
     def _build_model_assets(self):
         args: VeOmniVLMArguments = self.base.args
-        if self.base.model_config.model_type == "qwen3_siglip_vlm":
+        if self.base.model_config.model_type in SIGLIP_WRAPPER_MODEL_TYPES:
             tokenizer = build_tokenizer(args.model.tokenizer_path)
             self.base.processor = SimpleNamespace(tokenizer=tokenizer)
         else:
@@ -255,6 +248,8 @@ class VLMTrainer:
             }
         else:
             data_collate_info = {}
+        if self.base.model_config.model_type == "qwen3_moe_siglip_vlm":
+            data_collate_info["router_attention_mask"] = (-1, True, 0, 1)
         seq_classification = self.base.args.data.data_type == "classification"
         pad_to_length = self.base.args.train.pad_to_length
         self.base.collate_fn = MainCollator(
@@ -266,25 +261,9 @@ class VLMTrainer:
     def _build_optimizer(self):
         args: VeOmniVLMArguments = self.base.args
 
-        if self.base.model_config.model_type == "qwen3_siglip_vlm":
-            vit_params, connector_params, llm_params, other_params = [], [], [], []
-            for name, param in self.base.model.named_parameters():
-                if param.requires_grad:
-                    if name.startswith("vision_tower."):
-                        vit_params.append(param)
-                    elif name.startswith("connector."):
-                        connector_params.append(param)
-                    elif name.startswith("language_model."):
-                        llm_params.append(param)
-                    else:
-                        other_params.append(param)
-            param_groups = [
-                {"params": vit_params, "lr": args.train.vit_lr},
-                {"params": connector_params, "lr": args.train.connector_lr or args.train.optimizer.lr},
-                {"params": llm_params, "lr": args.train.llm_lr or args.train.optimizer.lr},
-                {"params": other_params, "lr": args.train.optimizer.lr},
-            ]
-            param_groups = [group for group in param_groups if group["params"]]
+        if self.base.model_config.model_type in SIGLIP_WRAPPER_MODEL_TYPES:
+            trainable_params = [param for param in self.base.model.parameters() if param.requires_grad]
+            param_groups = [{"params": trainable_params, "lr": args.train.optimizer.lr}] if trainable_params else []
         else:
             vit_params, other_params = [], []
             for name, param in self.base.model.named_parameters():

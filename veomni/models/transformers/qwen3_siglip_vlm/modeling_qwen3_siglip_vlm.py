@@ -356,8 +356,6 @@ class Qwen3SiglipVLMForConditionalGeneration(PreTrainedModel):
 
         if pixel_values is not None and image_grid_hw is not None and pixel_values.numel() > 0:
             image_mask = self._get_image_mask(input_ids, image_mask)
-            flat_embeds = inputs_embeds.reshape(-1, inputs_embeds.shape[-1]).clone()
-            flat_image_mask = image_mask.reshape(-1)
             vision_features = self.vision_tower(pixel_values, image_grid_hw)
             if parallel_state.sp_enabled:
                 unpadded_vision_tokens = int(image_grid_hw.prod(dim=-1).sum().item())
@@ -368,14 +366,13 @@ class Qwen3SiglipVLMForConditionalGeneration(PreTrainedModel):
                     unpad_dim_size=unpadded_vision_tokens,
                     group=parallel_state.sp_group,
                 )
-            image_features = self.connector(vision_features, image_grid_hw).to(dtype=flat_embeds.dtype)
-            if int(flat_image_mask.sum().item()) != image_features.shape[0]:
-                raise ValueError(
-                    f"Image token/features mismatch: tokens={int(flat_image_mask.sum().item())}, "
-                    f"features={image_features.shape[0]}."
-                )
-            flat_embeds[flat_image_mask] = image_features
-            inputs_embeds = flat_embeds.reshape_as(inputs_embeds)
+            image_features = self.connector(vision_features, image_grid_hw).to(
+                device=inputs_embeds.device, dtype=inputs_embeds.dtype
+            )
+            embeds_image_mask = (
+                image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device, non_blocking=True)
+            )
+            inputs_embeds = inputs_embeds.masked_scatter(embeds_image_mask, image_features)
         elif parallel_state.fsdp_enabled:
             dummy_grid_hw = torch.tensor(
                 [[parallel_state.sp_size if parallel_state.sp_enabled else 1, 1]],

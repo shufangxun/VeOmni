@@ -27,6 +27,8 @@ import torch
 import triton
 import triton.language as tl
 
+from .mask_utils import maybe_slice_attention_mask_for_gate_logits, sp_all_reduce_sum_
+
 
 # ---------------------------------------------------------------------------
 # Forward kernel — tiled reduction (no atomics)
@@ -221,21 +223,36 @@ class _FusedLoadBalancingLoss(torch.autograd.Function):
             HAS_MASK=has_mask,
         )
 
-        # Reduce partial sums across blocks.
-        expert_count = partial_expert_count.sum(0)
-        router_prob_sum = partial_router_prob_sum.sum(0)
+        # Reduce partial sums across blocks, then aggregate the non-differentiable
+        # sufficient statistics across the SP group before applying the nonlinear
+        # load-balancing formula. Averaging per-SP-rank aux losses is not equivalent
+        # to computing the aux loss on the global token set.
+        local_expert_count = partial_expert_count.sum(0)
+        local_router_prob_sum = partial_router_prob_sum.sum(0)
+        global_expert_count = local_expert_count.detach().clone()
+        global_total_weight = total_weight.detach().clone()
+        sp_all_reduce_sum_(global_expert_count)
+        sp_all_reduce_sum_(global_total_weight)
 
-        # loss = E * dot(expert_count, router_prob_sum) / total_weight^2
-        loss = torch.dot(expert_count, router_prob_sum) * (E / (total_weight * total_weight))
+        zero_total = global_total_weight.item() == 0
+        if zero_total:
+            loss = torch.tensor(0.0, device=device, dtype=torch.float32)
+        else:
+            local_loss = torch.dot(global_expert_count, local_router_prob_sum) * (
+                E / (global_total_weight * global_total_weight)
+            )
+            loss = local_loss.clone()
+            sp_all_reduce_sum_(loss)
 
         # Save for backward
         ctx.save_for_backward(
             concatenated_gate_logits,
-            expert_count,
+            global_expert_count,
             mask_weights if has_mask else torch.empty(0, device=device),
-            total_weight,
+            global_total_weight,
         )
         ctx.has_mask = has_mask
+        ctx.zero_total = zero_total
         ctx.E = E
         ctx.N = N
 
@@ -246,6 +263,9 @@ class _FusedLoadBalancingLoss(torch.autograd.Function):
         gate_logits, expert_count, mask_weights, total_weight = ctx.saved_tensors
         N, E = ctx.N, ctx.E
         has_mask = ctx.has_mask
+
+        if ctx.zero_total:
+            return torch.zeros_like(gate_logits), None, None, None, None
 
         # Compute gradients in float32 for precision; cast to input dtype at the end.
         grad_logits = torch.empty_like(gate_logits, dtype=torch.float32)
@@ -328,8 +348,14 @@ def load_balancing_loss_triton(
     assert E == num_experts, f"gate_logits last dim ({E}) != num_experts ({num_experts})"
 
     if attention_mask is not None:
-        batch_size, sequence_length = attention_mask.shape
         num_hidden_layers = len(gate_logits)
+        if N % num_hidden_layers != 0:
+            raise ValueError(
+                f"Mismatch between gate_logits total tokens ({N}) and number of router layers ({num_hidden_layers})."
+            )
+        tokens_per_layer = N // num_hidden_layers
+        attention_mask = maybe_slice_attention_mask_for_gate_logits(attention_mask, tokens_per_layer)
+        batch_size, sequence_length = attention_mask.shape
         expected_tokens = num_hidden_layers * batch_size * sequence_length
         if N != expected_tokens:
             raise ValueError(
@@ -345,8 +371,6 @@ def load_balancing_loss_triton(
             .contiguous()
         )
         total_weight = mask_weights.sum()
-        if total_weight == 0:
-            return torch.tensor(0.0, device=compute_device)
     else:
         mask_weights = None
         total_weight = torch.tensor(float(N), device=compute_device)

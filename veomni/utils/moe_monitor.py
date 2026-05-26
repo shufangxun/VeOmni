@@ -15,7 +15,7 @@
 """MoE Router Load Balance Monitor.
 
 Provides tools to monitor expert load distribution across MoE layers during training.
-Logs a [num_moe_layers, num_experts] heatmap and per-layer violation metrics to wandb.
+Logs the batch-level MaxVio metric averaged across MoE layers to wandb.
 
 Architecture:
     1. Router modules (e.g. PatchQwen3MoeTopKRouter) register ``router_forward_hook``
@@ -23,10 +23,11 @@ Architecture:
     2. The hook is a no-op (single ``if`` check) until a ``MoERouterMonitor`` is
        created and activated via ``set_active_monitor()``. This is done by the
        trainer when ``moe_load_balance_monitor_interval > 0``.
-    3. Once active, each router forward accumulates token-to-expert counts on device
-       (no CPU sync). At the configured interval, ``get_load_matrix()`` moves counts
-       to CPU (single sync) and produces a normalized frequency matrix.
-    4. ``compute_vio()`` derives max/min/avg violation metrics from the matrix.
+    3. Once active, each router forward accumulates token-to-expert counts on device.
+       At the end of each training step, ``get_load_matrix()`` moves counts to CPU
+       and produces a normalized frequency matrix for that training batch.
+    4. ``compute_maxvio_batch()`` derives the paper-style MaxVio averaged across
+       MoE layers. The callback only logs that scalar at the configured interval.
 
 This design avoids FSDP compatibility issues — hooks are on the original router modules,
 not discovered through the FSDP wrapper at runtime.
@@ -36,6 +37,7 @@ from typing import Dict, Optional
 
 import torch
 import torch.nn as nn
+from torch import distributed as dist
 
 
 # ---------------------------------------------------------------------------
@@ -76,6 +78,29 @@ def router_forward_hook(module: nn.Module, input, output):
     _active_monitor.record(module, output[2])
 
 
+def _is_moe_router_module(module: nn.Module) -> bool:
+    class_name = module.__class__.__name__.lower()
+    return "router" in class_name and hasattr(module, "top_k") and hasattr(module, "num_experts")
+
+
+def ensure_router_monitor_hooks(model: nn.Module) -> int:
+    """Register router monitor hooks on MoE router modules if missing.
+
+    Returns the number of newly registered hooks. Hooks are idempotent per module
+    instance via the _veomni_moe_monitor_hook_registered marker.
+    """
+    num_registered = 0
+    for module in model.modules():
+        if not _is_moe_router_module(module):
+            continue
+        if getattr(module, "_veomni_moe_monitor_hook_registered", False):
+            continue
+        module.register_forward_hook(router_forward_hook)
+        module._veomni_moe_monitor_hook_registered = True
+        num_registered += 1
+    return num_registered
+
+
 class MoERouterMonitor:
     """Monitors MoE expert load distribution via router forward hooks.
 
@@ -92,10 +117,9 @@ class MoERouterMonitor:
 
         # ... training runs, hooks auto-accumulate counts ...
 
-        # At logging interval:
+        # At the end of each training step:
         load_matrix = monitor.get_load_matrix(current_step=step)
-        image = monitor.create_wandb_image(load_matrix)
-        vio = MoERouterMonitor.compute_vio(load_matrix)
+        maxvio_batch = MoERouterMonitor.compute_maxvio_batch(load_matrix)
 
         # At train end:
         set_active_monitor(None)
@@ -145,15 +169,21 @@ class MoERouterMonitor:
         # Accumulate on device — detach to avoid graph retention.
         self._counts[mid] += counts.detach()
 
-    def get_load_matrix(self, current_step: int = 0) -> torch.Tensor:
+    def get_load_matrix(self, current_step: int = 0, global_reduce: bool = True) -> torch.Tensor:
         """Return the normalized load matrix and reset accumulated counts.
 
-        This is the **only** method that moves data from device to CPU, causing a
-        single CUDA sync. Should be called only at the logging interval (not every step).
+        This method moves data from device to CPU, causing a CUDA sync. The training
+        callback calls it once per step when MoE monitoring is enabled so the recorded
+        value matches the paper's per-training-batch MaxVio definition. When distributed
+        training is initialized, all ranks must call this method together because
+        global_reduce=True all-reduces the accumulated counts.
 
         Args:
             current_step: The current global training step, used to record
                 the accumulation range for heatmap captions.
+            global_reduce: Whether to sum counts across the default process group
+                before normalizing. This gives the computation-batch/global-rank
+                MaxVio used for EP/DP efficiency monitoring.
 
         Returns:
             A float tensor of shape ``[num_moe_layers, num_experts]`` where each
@@ -163,8 +193,11 @@ class MoERouterMonitor:
         if not self._counts:
             return torch.zeros(0, self.num_experts)
         self._accumulate_end_step = current_step
-        # Stack counts in layer order and move to CPU (single sync point).
-        matrix = torch.stack([self._counts[mid] for mid in self._layer_order]).float().cpu()
+        matrix = torch.stack([self._counts[mid] for mid in self._layer_order]).float()
+        if global_reduce and dist.is_available() and dist.is_initialized():
+            dist.all_reduce(matrix, op=dist.ReduceOp.SUM)
+        # Move to CPU after the optional global reduction (single sync point).
+        matrix = matrix.cpu()
         # Normalize each row (layer) to sum to 1.0.
         row_sums = matrix.sum(dim=1, keepdim=True).clamp(min=1.0)
         matrix = matrix / row_sums
@@ -191,11 +224,14 @@ class MoERouterMonitor:
         """
         import io
 
-        import matplotlib
+        try:
+            import matplotlib
 
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        import wandb
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+            import wandb
+        except ModuleNotFoundError:
+            return None
 
         if caption is None:
             start, end = self._last_step_range
@@ -257,6 +293,23 @@ class MoERouterMonitor:
             "min_vio": deviation.min(dim=1).values,
             "avg_vio": deviation.abs().mean(dim=1),
         }
+
+    @staticmethod
+    def compute_maxvio_batch(load_matrix: torch.Tensor) -> torch.Tensor:
+        """Compute paper-style batch MaxVio averaged across MoE layers.
+
+        The paper defines per-layer MaxVio as the maximum overload ratio:
+
+            ``max_i((Load_i - expected_load_i) / expected_load_i)``
+
+        ``load_matrix`` is already normalized by total routed assignments in
+        each layer, so the expected load is ``1 / num_experts`` and the overload
+        ratio is ``load_matrix * num_experts - 1``. The reported model-level
+        value is the mean across layers.
+        """
+        if load_matrix.numel() == 0:
+            return torch.tensor(float("nan"))
+        return MoERouterMonitor.compute_vio(load_matrix)["max_vio"].mean()
 
     def _reset_counts(self):
         """Zero out all accumulated counts (on device) for the next interval."""

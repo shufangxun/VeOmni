@@ -81,6 +81,7 @@ modeling symbols it uses:
 | `qwen2` | `Qwen2RMSNorm` | `apply_rotary_pos_emb` | `Qwen2MLP` | — |
 | `qwen3` | `Qwen3RMSNorm` | `apply_rotary_pos_emb` | `Qwen3MLP` | — |
 | `qwen3_moe` | `Qwen3MoeRMSNorm` | `apply_rotary_pos_emb` | `Qwen3MoeMLP` | — |
+| `qwen3_moe_siglip_vlm` | `Qwen3MoeRMSNorm` via `language_model` | `apply_rotary_pos_emb` via `language_model` | `Qwen3MoeMLP` via `language_model` | Reuses Qwen3-MoE generated ops; SigLIP vision tower and connector use eager PyTorch modules. |
 | `seed_oss` | `SeedOssRMSNorm` | `apply_rotary_pos_emb` | `SeedOssMLP` | — |
 | `qwen2_vl` | `Qwen2RMSNorm` | `apply_multimodal_rotary_pos_emb` | `Qwen2MLP` | `rotary_pos_emb.npu` disabled; vision RoPE via `custom_patches` |
 | `qwen3_vl` | `Qwen3VLTextRMSNorm` | `apply_rotary_pos_emb` | *(n/a)* | `liger_kernel` disabled for RMSNorm/RoPE; vision RoPE via `custom_patches` |
@@ -93,7 +94,7 @@ modeling symbols it uses:
 model:
   ops_implementation:
     attn_implementation: flash_attention_2
-    moe_implementation: fused
+    moe_implementation: fused_triton
     cross_entropy_loss_implementation: liger_kernel
     load_balancing_loss_implementation: triton
     rms_norm_implementation: liger_kernel

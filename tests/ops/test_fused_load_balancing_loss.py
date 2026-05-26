@@ -14,13 +14,19 @@
 
 """Tests for fused load balancing loss against the HuggingFace reference."""
 
+import os
+import socket
+
 import pytest
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 from transformers.models.qwen3_moe.modeling_qwen3_moe import (
     load_balancing_loss_func as _reference_load_balancing_loss,
 )
 
-from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_torch_device
+from veomni.distributed.parallel_state import init_parallel_state
+from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_dist_comm_backend, get_torch_device
 
 
 DEFAULT_ATOL = 1e-4
@@ -67,6 +73,138 @@ def _measure_peak_memory(fn):
     fn()
     dev.synchronize()
     return dev.max_memory_allocated()
+
+
+def _find_free_port():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("", 0))
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        return sock.getsockname()[1]
+
+
+def _dist_worker_entry(rank, world_size, port, func, args):
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = str(port)
+    os.environ["RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
+    os.environ["LOCAL_RANK"] = str(rank)
+
+    if get_torch_device().is_available() and get_torch_device().device_count() >= world_size:
+        backend = get_dist_comm_backend()
+        get_torch_device().set_device(rank)
+    else:
+        backend = "gloo"
+
+    try:
+        dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
+        func(*args)
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+def _torchrun(func, world_size, *args):
+    if get_torch_device().is_available() and get_torch_device().device_count() < world_size:
+        pytest.skip(f"Requires {world_size} {get_device_type()} devices")
+
+    mp.spawn(_dist_worker_entry, args=(world_size, _find_free_port(), func, args), nprocs=world_size, join=True)
+
+
+def _make_deterministic_gate_logits(num_layers, batch_size, seq_len, num_experts, device):
+    logits = []
+    base = torch.arange(batch_size * seq_len * num_experts, device=device, dtype=torch.float32)
+    base = base.reshape(batch_size, seq_len, num_experts)
+    for layer_idx in range(num_layers):
+        layer = torch.sin(base * 0.17 + layer_idx * 0.31) + torch.cos(base * 0.07 - layer_idx * 0.13)
+        logits.append(layer.reshape(batch_size * seq_len, num_experts).clone().requires_grad_(True))
+    return tuple(logits)
+
+
+def _slice_sequence_chunk(tensor, rank, world_size):
+    seq_len = tensor.shape[1]
+    local_seq_len = (seq_len + world_size - 1) // world_size
+    padded_seq_len = local_seq_len * world_size
+    if padded_seq_len != seq_len:
+        pad_shape = list(tensor.shape)
+        pad_shape[1] = padded_seq_len - seq_len
+        tensor = torch.cat((tensor, torch.zeros(pad_shape, dtype=tensor.dtype, device=tensor.device)), dim=1)
+    start = rank * local_seq_len
+    return tensor[:, start : start + local_seq_len].contiguous()
+
+
+def _sp_load_balancing_worker(backend_name):
+    from veomni.ops.kernels.load_balancing_loss.eager import load_balancing_loss_pytorch
+    from veomni.ops.kernels.load_balancing_loss.triton import load_balancing_loss_triton
+
+    world_size = dist.get_world_size()
+    rank = dist.get_rank()
+    init_parallel_state(dp_size=1, ulysses_size=world_size, device_type=_DEVICE)
+
+    device = torch.device(f"{_DEVICE}:{rank}")
+    num_layers = 3
+    batch_size = 2
+    seq_len = 7
+    num_experts = 8
+    top_k = 2
+    local_seq_len = (seq_len + world_size - 1) // world_size
+    padded_seq_len = local_seq_len * world_size
+
+    full_mask = torch.tensor(
+        [[1, 1, 1, 1, 1, 0, 0], [1, 1, 0, 1, 1, 1, 0]],
+        device=device,
+        dtype=torch.float32,
+    )
+    if padded_seq_len != seq_len:
+        full_mask = torch.cat(
+            (full_mask, torch.zeros(batch_size, padded_seq_len - seq_len, device=device, dtype=full_mask.dtype)),
+            dim=1,
+        )
+
+    ref_logits = _make_deterministic_gate_logits(num_layers, batch_size, padded_seq_len, num_experts, device)
+    ref_loss = _reference_load_balancing_loss(ref_logits, num_experts, top_k, full_mask)
+    ref_loss.backward()
+    ref_grads = [
+        logits.grad.reshape(batch_size, padded_seq_len, num_experts).detach().clone() for logits in ref_logits
+    ]
+
+    local_logits = []
+    for layer_logits in ref_logits:
+        layer_local = _slice_sequence_chunk(
+            layer_logits.detach().reshape(batch_size, padded_seq_len, num_experts),
+            rank,
+            world_size,
+        )
+        local_logits.append(layer_local.reshape(batch_size * local_seq_len, num_experts).clone().requires_grad_(True))
+    local_logits = tuple(local_logits)
+    local_mask = _slice_sequence_chunk(full_mask, rank, world_size)
+
+    backend = load_balancing_loss_triton if backend_name == "triton" else load_balancing_loss_pytorch
+    sp_loss = backend(local_logits, num_experts, top_k, local_mask)
+    sp_loss.backward()
+
+    torch.testing.assert_close(sp_loss, ref_loss.detach(), atol=DEFAULT_ATOL, rtol=DEFAULT_ATOL)
+    for layer_idx, (local_layer_logits, ref_layer_grad) in enumerate(zip(local_logits, ref_grads)):
+        expected_grad = _slice_sequence_chunk(ref_layer_grad, rank, world_size).reshape_as(local_layer_logits.grad)
+        torch.testing.assert_close(
+            local_layer_logits.grad,
+            expected_grad,
+            atol=DEFAULT_ATOL,
+            rtol=DEFAULT_ATOL,
+            msg=f"SP gradient mismatch for {backend_name} backend at layer {layer_idx}",
+        )
+
+    dist.barrier()
+
+
+# ---------------------------------------------------------------------------
+# Sequence-parallel distributed tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("backend_name", ["eager", "triton"])
+def test_sp_load_balancing_loss_matches_global_reference(backend_name):
+    _skip_no_cuda()
+    _torchrun(_sp_load_balancing_worker, 2, backend_name)
 
 
 # ---------------------------------------------------------------------------

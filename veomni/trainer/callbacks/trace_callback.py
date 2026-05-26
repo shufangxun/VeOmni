@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 import time
 from typing import TYPE_CHECKING, Any, Dict, List
 
@@ -35,6 +36,8 @@ class MoERouterMonitorCallback(Callback):
     def __init__(self, trainer: "BaseTrainer") -> None:
         super().__init__(trainer)
         self.monitor = None
+        self._maxvio_batch_sum = 0.0
+        self._maxvio_batch_count = 0
 
         args: "VeOmniArguments" = self.trainer.args
         if not args.train.wandb.enable:
@@ -44,63 +47,76 @@ class MoERouterMonitorCallback(Callback):
             logger.info_rank0("MoE router monitor disabled (moe_load_balance_monitor_interval=0).")
             return
 
-        config = self.trainer.model_config
-        if hasattr(config, "num_experts"):
-            from ...utils.moe_monitor import MoERouterMonitor, set_active_monitor
+        num_experts = self._get_num_experts(self.trainer.model_config)
+        if num_experts is not None:
+            from ...utils.moe_monitor import MoERouterMonitor, ensure_router_monitor_hooks, set_active_monitor
 
-            self.monitor = MoERouterMonitor(config.num_experts)
+            num_hooks = ensure_router_monitor_hooks(self.trainer.model)
+            self.monitor = MoERouterMonitor(num_experts)
             set_active_monitor(self.monitor)
             logger.info_rank0(
-                f"MoE router monitor enabled: num_experts={config.num_experts}, "
-                f"interval={args.train.moe_load_balance_monitor_interval}"
+                f"MoE router monitor enabled: num_experts={num_experts}, "
+                f"interval={args.train.moe_load_balance_monitor_interval}, router_hooks={num_hooks}"
             )
         else:
             logger.warning_rank0(
-                "moe_load_balance_monitor_interval > 0 but model config has no 'num_experts'. "
-                "MoE router monitor not activated."
+                "moe_load_balance_monitor_interval > 0 but model config has no 'num_experts' or "
+                "'text_config.num_experts'. MoE router monitor not activated."
             )
+
+    @staticmethod
+    def _get_num_experts(config: Any) -> int | None:
+        for candidate in (config, getattr(config, "text_config", None)):
+            if candidate is None:
+                continue
+            num_experts = getattr(candidate, "num_experts", None)
+            if num_experts is not None:
+                return int(num_experts)
+        return None
+
+    @staticmethod
+    def _build_wandb_metrics(maxvio_batch_sum: float, maxvio_batch_count: int) -> dict[str, float]:
+        if maxvio_batch_count <= 0:
+            return {}
+        return {"moe/maxvio_batch": maxvio_batch_sum / maxvio_batch_count}
 
     def on_step_end(self, state: TrainerState, **kwargs) -> None:
         args: "VeOmniArguments" = self.trainer.args
-        if (
-            self.monitor
-            and state.global_step % args.train.moe_load_balance_monitor_interval == 0
-            and args.train.global_rank == 0
-        ):
-            import wandb
+        if not self.monitor:
+            return
 
-            load_matrix = self.monitor.get_load_matrix(current_step=state.global_step)
-            num_layers = load_matrix.shape[0]
-            if num_layers == 0:
+        load_matrix = self.monitor.get_load_matrix(current_step=state.global_step)
+        num_layers = load_matrix.shape[0]
+        if num_layers == 0:
+            if args.train.global_rank == 0 and state.global_step % args.train.moe_load_balance_monitor_interval == 0:
                 logger.warning_rank0(
                     f"Step {state.global_step}: MoE router monitor has no recorded data. "
                     "Check that router forward hooks are registered (e.g. PatchQwen3MoeTopKRouter)."
                 )
-                return
-            from ...utils.moe_monitor import MoERouterMonitor
+            return
 
-            image = self.monitor.create_wandb_image(load_matrix)
-            vio = MoERouterMonitor.compute_vio(load_matrix)
-            max_vio, min_vio, avg_vio = vio["max_vio"], vio["min_vio"], vio["avg_vio"]
-            metrics = {"moe/expert_load_heatmap": image}
-            for i in range(num_layers):
-                metrics[f"moe/max_vio/layer_{i}"] = max_vio[i].item()
-                metrics[f"moe/min_vio/layer_{i}"] = min_vio[i].item()
-                metrics[f"moe/avg_vio/layer_{i}"] = avg_vio[i].item()
-            metrics["moe/max_vio/max"] = max_vio.max().item()
-            metrics["moe/max_vio/avg"] = max_vio.mean().item()
-            metrics["moe/min_vio/max"] = min_vio.max().item()
-            metrics["moe/min_vio/avg"] = min_vio.mean().item()
-            metrics["moe/avg_vio/max"] = avg_vio.max().item()
-            metrics["moe/avg_vio/avg"] = avg_vio.mean().item()
+        from ...utils.moe_monitor import MoERouterMonitor
+
+        maxvio_batch = MoERouterMonitor.compute_maxvio_batch(load_matrix).item()
+        if not math.isnan(maxvio_batch):
+            self._maxvio_batch_sum += maxvio_batch
+            self._maxvio_batch_count += 1
+
+        if state.global_step % args.train.moe_load_balance_monitor_interval != 0:
+            return
+
+        metrics = self._build_wandb_metrics(self._maxvio_batch_sum, self._maxvio_batch_count)
+        self._maxvio_batch_sum = 0.0
+        self._maxvio_batch_count = 0
+
+        if args.train.global_rank == 0 and metrics:
+            import wandb
+
             wandb.log(metrics, step=state.global_step)
             logger.info_rank0(
-                f"Step {state.global_step}: uploaded MoE load balance heatmap "
-                f"({num_layers} layers, {load_matrix.shape[1]} experts, "
-                f"steps {self.monitor._last_step_range[0]}-{self.monitor._last_step_range[1]}), "
-                f"max_vio: max={vio['max_vio'].max().item():.4f} avg={vio['max_vio'].mean().item():.4f}, "
-                f"min_vio: max={vio['min_vio'].max().item():.4f} avg={vio['min_vio'].mean().item():.4f}, "
-                f"avg_vio: max={vio['avg_vio'].max().item():.4f} avg={vio['avg_vio'].mean().item():.4f}."
+                f"Step {state.global_step}: logged MoE MaxVio_batch={metrics['moe/maxvio_batch']:.4f} "
+                f"averaged across {num_layers} layers and the last "
+                f"{args.train.moe_load_balance_monitor_interval} step(s)."
             )
 
     def on_train_end(self, state: TrainerState, **kwargs) -> None:
@@ -227,6 +243,12 @@ class TqdmCallback(Callback):
         self.data_loader_tqdm.close()
 
     def on_step_end(self, state: TrainerState, **kwargs) -> None:
-        postfix = ", ".join(f"{k.split('/', 1)[-1]}: {v:.2f}" for k, v in self.trainer.step_train_metrics.items())
+        def _format_metric(name: str, value: float) -> str:
+            short_name = name.split("/", 1)[-1]
+            if short_name == "lr" or short_name.endswith("_weighted"):
+                return f"{short_name}: {value:.4g}"
+            return f"{short_name}: {value:.2f}"
+
+        postfix = ", ".join(_format_metric(k, v) for k, v in self.trainer.step_train_metrics.items())
         self.data_loader_tqdm.set_postfix_str(postfix)
         self.data_loader_tqdm.update()

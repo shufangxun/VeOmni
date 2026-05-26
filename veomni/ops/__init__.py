@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+from dataclasses import fields
 from typing import TYPE_CHECKING
 
 from ..utils import logging
@@ -88,6 +89,7 @@ def apply_ops_config(ops_config: OpsImplementationConfig) -> None:
     ``device_patch.py``.
     """
     set_ops_config(ops_config)
+    logger.info_rank0(format_ops_config(ops_config))
 
     modeling_backend = get_env("MODELING_BACKEND")
     if modeling_backend == "hf":
@@ -100,12 +102,22 @@ def apply_ops_config(ops_config: OpsImplementationConfig) -> None:
     applied = apply_global_ops(ops_config)
     applied.insert(0, ce_label)
     logger.info_rank0(f"✅ VeOmni ops config applied: {', '.join(applied)}.")
-    logger.info_rank0(format_kernel_functions())
+    logger.info_rank0(format_kernel_functions(title="OPS FUNCTION POINTERS (pre-model binding)"))
 
 
-def format_kernel_functions() -> str:
+def format_ops_config(ops_config: OpsImplementationConfig) -> str:
     lines = []
-    lines.append("\n=========== OPS ============")
+    lines.append("\n=========== OPS CONFIG ============")
+    for config_field in fields(ops_config):
+        if config_field.name == "attn_implementation" or config_field.name.endswith("_implementation"):
+            lines.append(f"{config_field.name} = {getattr(ops_config, config_field.name)}")
+    lines.append("===================================")
+    return "\n".join(lines)
+
+
+def format_kernel_functions(title: str = "OPS FUNCTION POINTERS") -> str:
+    lines = []
+    lines.append(f"\n=========== {title} ============")
 
     for alias, func in build_ALL_OPS():
         impl = func.__name__ if func is not None else "None"
@@ -115,7 +127,7 @@ def format_kernel_functions() -> str:
     # global — surface it here so the log still shows the active CE kernel.
     lines.append(f"cross_entropy = {_current_cross_entropy_name()}")
 
-    lines.append("==============================")
+    lines.append("=" * (len(title) + 24))
     return "\n".join(lines)
 
 

@@ -1,12 +1,12 @@
 model:
-  config_path: /root/shufangxun/checkpoints/qwen3_siglip_1p7b_init
-  model_path: /root/shufangxun/checkpoints/qwen3_siglip_1p7b_init
-  tokenizer_path: Qwen/Qwen3-1.7B-Base
+  config_path: /tmp/qwen3_siglip_hf_eval/global_step_100
+  model_path: /tmp/qwen3_siglip_hf_eval/global_step_100
+  tokenizer_path: /tmp/qwen3_siglip_hf_eval/global_step_100
   ops_implementation:
     attn_implementation: flash_attention_2
 
 data:
-  train_path: configs/multimodal/data/qwen3_siglip_stage1_connector.yaml
+  train_path: configs/multimodal/data/qwen3_siglip_stage2_full.yaml
   multisource_datasets_type: veomni_weighted_multisource
   datasets_type: iterable
   data_type: qwen3_siglip_vlm
@@ -38,30 +38,30 @@ train:
       enable_activation: false
   gradient_checkpointing:
     enable: true
-  global_batch_size: 32
+  global_batch_size: 16
   micro_batch_size: 1
   log_train_source_loss_steps: 5
   log_train_domain_loss_steps: 5
   bsz_warmup_ratio: 0.01
   optimizer:
     type: adamw
-    lr: 1.0e-4
+    lr: 1.0e-5
     lr_warmup_ratio: 0.01
     lr_decay_style: cosine
     weight_decay: 0.01
     max_grad_norm: 1.0
-  freeze_vit: true
+  freeze_vit: false
   freeze_connector: false
-  freeze_llm: true
+  freeze_llm: false
   init_device: meta
   enable_full_determinism: false
   empty_cache_steps: 500
   checkpoint:
-    output_dir: exp/qwen3-siglip-1.7b-stage1-connector
+    output_dir: exp/qwen3-siglip-1.7b-stage2-full
     manager: dcp
-    save_steps: 5
+    save_steps: 200
     save_hf_weights: true
   wandb:
     enable: true
     project: qwen3-siglip-vlm
-    name: Qwen3-SigLIP-1.7B-stage1-connector
+    name: Qwen3-SigLIP-1.7B-stage2-full

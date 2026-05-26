@@ -24,6 +24,12 @@ from typing import Optional, Union
 
 import torch
 
+from .mask_utils import (
+    maybe_slice_attention_mask_for_gate_logits,
+    sp_all_reduce_sum_,
+    sp_all_reduce_sum_with_local_backward,
+)
+
 
 def load_balancing_loss_pytorch(
     gate_logits: Union[torch.Tensor, tuple[torch.Tensor], None],
@@ -72,8 +78,15 @@ def load_balancing_loss_pytorch(
 
     # Prepare per-token mask weights if attention_mask is provided.
     if attention_mask is not None:
+        tokens_per_layer = gate_logits[0].shape[0]
+        attention_mask = maybe_slice_attention_mask_for_gate_logits(attention_mask, tokens_per_layer)
         batch_size, sequence_length = attention_mask.shape
-        # Expand mask to cover all layers: [num_layers, batch_size, seq_len] -> [num_layers * batch_size * seq_len]
+        expected_tokens = batch_size * sequence_length
+        if tokens_per_layer != expected_tokens:
+            raise ValueError(
+                f"Mismatch between per-layer gate_logits tokens ({tokens_per_layer}) and attention_mask shape. "
+                f"Expected {batch_size} * {sequence_length} = {expected_tokens} tokens."
+            )
         mask_flat = attention_mask.to(compute_device, dtype=torch.float32)
     else:
         mask_flat = None
@@ -107,8 +120,15 @@ def load_balancing_loss_pytorch(
 
             total_weight = total_weight + layer_logits.shape[0]
 
-    if total_weight == 0:
-        return torch.tensor(0.0, device=compute_device)
+    global_expert_count = expert_count.detach().clone()
+    global_total_weight = total_weight.detach().clone()
+    sp_all_reduce_sum_(global_expert_count)
+    sp_all_reduce_sum_(global_total_weight)
 
-    loss = torch.dot(expert_count, router_prob_sum) * (num_experts / (total_weight * total_weight))
-    return loss
+    if global_total_weight == 0:
+        return router_prob_sum.sum() * 0.0
+
+    loss = torch.dot(global_expert_count, router_prob_sum) * (
+        num_experts / (global_total_weight * global_total_weight)
+    )
+    return sp_all_reduce_sum_with_local_backward(loss)

@@ -88,3 +88,31 @@ def mean_global_loss(
         loss_dict[key] = cur_loss
 
     return loss_dict
+
+
+def global_loss_weight(
+    loss_name: str,
+    micro_batch_token_len: dict[str, torch.Tensor],
+    micro_batches_token_len: dict[str, torch.Tensor],
+) -> float:
+    """Return the scalar weight used to place a micro-batch loss in a global batch.
+
+    This mirrors ``mean_global_loss`` without touching the loss tensor itself.
+    It is used for non-token losses that are produced once per micro-batch,
+    such as MoE router auxiliary loss, so their scale stays invariant under
+    gradient accumulation and sequence parallelism.
+    """
+    cur_token_len = micro_batch_token_len[f"{loss_name}_tokens"]
+    if get_parallel_state().sp_enabled:
+        cur_token_len = all_reduce(cur_token_len.item(), op="sum", group=get_parallel_state().sp_group)
+    else:
+        cur_token_len = cur_token_len.item()
+
+    all_reduced_len = all_reduce(micro_batches_token_len[f"{loss_name}_tokens"].item(), op="sum")
+    if all_reduced_len == 0:
+        return 0.0
+
+    weight = cur_token_len / all_reduced_len * get_parallel_state().fsdp_size
+    if get_parallel_state().sp_enabled:
+        weight = weight / get_parallel_state().sp_size
+    return float(weight)

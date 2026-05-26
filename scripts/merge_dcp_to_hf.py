@@ -69,12 +69,12 @@ def _maybe_write_qwen3_siglip_chat_template(save_path: str) -> None:
     except Exception as exc:
         logger.warning(f"Failed to inspect config for chat template override: {exc}")
         return
-    if model_type != "qwen3_siglip_vlm":
+    if model_type not in {"qwen3_siglip_vlm", "qwen3_moe_siglip_vlm"}:
         return
     chat_template_path = os.path.join(save_path, "chat_template.jinja")
     with open(chat_template_path, "w", encoding="utf-8") as f:
         f.write(_get_qwen3_siglip_chat_template())
-    logger.info("Wrote canonical qwen3_siglip_vlm chat_template.jinja")
+    logger.info(f"Wrote canonical {model_type} chat_template.jinja")
 
 
 @torch.no_grad()

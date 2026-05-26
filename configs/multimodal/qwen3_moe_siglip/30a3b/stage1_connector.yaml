@@ -1,12 +1,18 @@
 model:
-  config_path: /tmp/qwen3_siglip_hf_eval/global_step_100
-  model_path: /tmp/qwen3_siglip_hf_eval/global_step_100
-  tokenizer_path: /tmp/qwen3_siglip_hf_eval/global_step_100
+  config_path: /root/shufangxun/checkpoints/qwen3_moe_siglip_30a3b_init
+  model_path: /root/shufangxun/checkpoints/qwen3_moe_siglip_30a3b_init
+  tokenizer_path: /root/shufangxun/checkpoints/qwen3_moe_siglip_30a3b_init
+  model_config:
+    text_config:
+      output_router_logits: true
+      router_aux_loss_coef: 0.001
   ops_implementation:
     attn_implementation: flash_attention_2
+    moe_implementation: fused_triton
+    load_balancing_loss_implementation: triton
 
 data:
-  train_path: configs/multimodal/data/qwen3_siglip_stage2_dense.yaml
+  train_path: configs/multimodal/data/qwen3_siglip_stage1_connector.yaml
   multisource_datasets_type: veomni_weighted_multisource
   datasets_type: iterable
   data_type: qwen3_siglip_vlm
@@ -28,6 +34,7 @@ data:
 train:
   accelerator:
     ulysses_size: 1
+    ep_size: 4
     fsdp_config:
       fsdp_mode: fsdp2
       full_shard: true
@@ -42,29 +49,27 @@ train:
   micro_batch_size: 1
   log_train_source_loss_steps: 5
   log_train_domain_loss_steps: 5
+  moe_load_balance_monitor_interval: 1
   bsz_warmup_ratio: 0.01
   optimizer:
     type: adamw
-    lr: 1.0e-5
+    lr: 1.0e-4
     lr_warmup_ratio: 0.01
     lr_decay_style: cosine
     weight_decay: 0.01
     max_grad_norm: 1.0
-  vit_lr: 1.0e-6
-  connector_lr: 2.0e-5
-  llm_lr: 1.0e-5
-  freeze_vit: false
+  freeze_vit: true
   freeze_connector: false
-  freeze_llm: false
+  freeze_llm: true
   init_device: meta
   enable_full_determinism: false
   empty_cache_steps: 500
   checkpoint:
-    output_dir: exp/qwen3-siglip-1.7b-stage2-dense
+    output_dir: exp/qwen3-moe-siglip-30a3b-stage1-connector
     manager: dcp
-    save_steps: 200
-    save_hf_weights: true
+    save_steps: 0
+    save_hf_weights: false
   wandb:
     enable: true
-    project: qwen3-siglip-vlm
-    name: Qwen3-SigLIP-1.7B-stage2-dense
+    project: qwen3-moe-siglip-vlm
+    name: Qwen3-MoE-SigLIP-30A3B-stage1-connector

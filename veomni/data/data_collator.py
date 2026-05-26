@@ -251,6 +251,9 @@ class PackingCollator(DataCollator):
                 if pack_dim == -1:
                     batch[key] = batch[key].unsqueeze(0)
 
+        if "router_attention_mask" in self.collate_infos and "router_attention_mask" not in batch:
+            batch["router_attention_mask"] = batch["attention_mask"].clone()
+
         if self.pad_to_length:
             batch = self.pad_batch_to_length(batch)
 

@@ -193,4 +193,39 @@ def test_seqcls_collator_pad_to_length_sp_enabled(monkeypatch, features_two_samp
     assert out["max_length_k"] == exp_max_length
 
 
+def test_router_attention_mask_preserves_real_tokens_under_sp(monkeypatch, features_two_samples):
+    import veomni.data.data_collator as m
+
+    pad_to_length = 8
+    sp_size = 2
+    token_labels = [
+        {
+            **features_two_samples[0],
+            "labels": torch.tensor([2, 3, 4], dtype=torch.long),
+        },
+        {
+            **features_two_samples[1],
+            "labels": torch.tensor([1, 2], dtype=torch.long),
+        },
+    ]
+
+    monkeypatch.setattr(m, "get_parallel_state", lambda: _fake_ps(sp_enabled=True, sp_size=sp_size, sp_rank=0))
+    collator = m.MainCollator(
+        pad_to_length=pad_to_length,
+        data_collate_info={"router_attention_mask": (-1, True, 0, 1)},
+    )
+    out = collator(token_labels)
+    assert torch.equal(out["attention_mask"], torch.ones(1, pad_to_length, dtype=torch.long))
+    assert torch.equal(out["router_attention_mask"], torch.tensor([[1, 1, 1, 1]], dtype=torch.long))
+
+    monkeypatch.setattr(m, "get_parallel_state", lambda: _fake_ps(sp_enabled=True, sp_size=sp_size, sp_rank=1))
+    collator = m.MainCollator(
+        pad_to_length=pad_to_length,
+        data_collate_info={"router_attention_mask": (-1, True, 0, 1)},
+    )
+    out = collator(token_labels)
+    assert torch.equal(out["attention_mask"], torch.ones(1, pad_to_length, dtype=torch.long))
+    assert torch.equal(out["router_attention_mask"], torch.tensor([[1, 0, 0, 0]], dtype=torch.long))
+
+
 # TODO: add omni data ci test

@@ -32,45 +32,35 @@
 
 from collections.abc import Callable
 from typing import Optional
-
 import torch
+import torch.nn.functional as F
 from torch import nn
 from transformers import initialization as init
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.generation import GenerationMixin
-from transformers.integrations import (
-    use_kernel_forward_from_hub,
-    use_kernelized_func,
-)
+from transformers.integrations import use_experts_implementation, use_kernel_forward_from_hub, use_kernel_func_from_hub, use_kernelized_func
 from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
-from transformers.modeling_layers import (
-    GenericForQuestionAnswering,
-    GenericForSequenceClassification,
-    GenericForTokenClassification,
-    GradientCheckpointingLayer,
-)
+from transformers.modeling_layers import GenericForQuestionAnswering, GenericForSequenceClassification, GenericForTokenClassification, GradientCheckpointingLayer
 from transformers.modeling_outputs import MoeModelOutputWithPast
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
-from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple, is_grouped_mm_available
 from transformers.utils.generic import maybe_autocast, merge_with_config_defaults
 from transformers.utils.output_capturing import OutputRecorder, capture_outputs
+from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 
 # Additional imports for patches
 from veomni.ops import fused_moe_forward
+from veomni.utils.model_outputs import MoeCausalLMOutputWithLogProbs
+from veomni.utils.moe_router_replay import get_active_replay, maybe_replay_indices
 
 # Additional import blocks for patches
 # ── OpSlot declarations ──────────────────────────────────────────────────
 # These are bound at model-build time by _bind_veomni_ops() in auto.py.
 from veomni.ops.dispatch import OpSlot
-from veomni.utils.model_outputs import MoeCausalLMOutputWithLogProbs
-from veomni.utils.moe_router_replay import get_active_replay, maybe_replay_indices
-
-
 veomni_rms_norm = OpSlot("rms_norm", "standard")
 veomni_apply_rotary_pos_emb = OpSlot("rotary_pos_emb", "full")
 veomni_swiglu_mlp = OpSlot("swiglu_mlp", "standard")
@@ -771,6 +761,7 @@ class Qwen3MoeForCausalLM(Qwen3MoePreTrainedModel, GenerationMixin):
         output_router_logits = (
             output_router_logits if output_router_logits is not None else self.config.output_router_logits
         )
+        router_attention_mask = kwargs.pop("router_attention_mask", None)
 
         outputs: MoeModelOutputWithPast = self.model(
             input_ids=input_ids,
@@ -827,14 +818,14 @@ class Qwen3MoeForCausalLM(Qwen3MoePreTrainedModel, GenerationMixin):
                     outputs.router_logits,
                     self.num_experts,
                     self.num_experts_per_tok,
-                    attention_mask,
+                    router_attention_mask if router_attention_mask is not None else attention_mask,
                 )
             else:
                 aux_loss = load_balancing_loss_func(
                     outputs.router_logits,
                     self.num_experts,
                     self.num_experts_per_tok,
-                    attention_mask,
+                    router_attention_mask if router_attention_mask is not None else attention_mask,
                 )
             if labels is not None:
                 loss += self.router_aux_loss_coef * aux_loss.to(loss.device)

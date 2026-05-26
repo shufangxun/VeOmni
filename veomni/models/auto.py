@@ -99,7 +99,10 @@ def _bind_veomni_ops(modeling_module, ops_config: OpsImplementationConfig) -> bo
         apply_veomni_fused_moe_patch(fused_moe_kernel=moe_experts_kernel)
 
     if bound:
+        from ..ops import format_kernel_functions
+
         logger.info_rank0(f"OpSlot dispatch bound: {', '.join(bound)}.")
+        logger.info_rank0(format_kernel_functions(title="OPS FUNCTION POINTERS (post-model binding)"))
     return bool(bound)
 
 

@@ -91,6 +91,7 @@ Skills follow the [Agent Skills](https://agentskills.io) open standard. Each ski
 | Bug fix / debugging | `/veomni-debug` |
 | Code review (pre-commit) | `/veomni-review` |
 | Add new model | `/veomni-new-model` |
+| Adapt LLM/VLM training workflow | `/veomni-adapt-llm-vlm` |
 | Migrate existing model to transformers v5 | `/veomni-migrate-transformers-v5` |
 | Add new op/kernel | `/veomni-new-op` |
 | Update dependencies (uv) | `/veomni-uv-update` |
@@ -99,6 +100,7 @@ Skills follow the [Agent Skills](https://agentskills.io) open standard. Each ski
 ### Quick Decision Guide
 
 - **"Add support for model X"** → `/veomni-new-model`
+- **"Adapt a dense LLM/VLM like Qwen3 or SigLIP+Qwen3"** → `/veomni-adapt-llm-vlm`
 - **"Migrate X to transformers v5" / "port X to patchgen" / "convert monkey patch to generated modeling"** → `/veomni-migrate-transformers-v5`
 - **"Add a new kernel / fused op"** → `/veomni-new-op`
 - **"Fix this error" / "training hangs" / "wrong results"** → `/veomni-debug`

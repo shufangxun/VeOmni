@@ -67,7 +67,7 @@ from ..utils.device import (
     get_torch_device,
     synchronize,
 )
-from ..utils.loss_utils import count_loss_token, mean_global_loss
+from ..utils.loss_utils import count_loss_token, global_loss_weight, mean_global_loss
 from ..utils.model_utils import pretty_print_trainable_parameters
 from .callbacks import (
     CheckpointerCallback,
@@ -342,9 +342,13 @@ class BaseTrainer(Stateful, ABC):
     def _build_collate_fn(self):
         seq_classification = self.args.data.data_type == "classification"
         pad_to_length = self.args.train.pad_to_length
+        data_collate_info = {}
+        if getattr(self.model_config, "model_type", None) == "qwen3_moe":
+            data_collate_info["router_attention_mask"] = (-1, True, 0, 1)
         self.collate_fn = MainCollator(
             pad_to_length=pad_to_length,
             seq_classification=seq_classification,
+            data_collate_info=data_collate_info,
         )
 
     def _build_dataloader(self):
@@ -529,11 +533,46 @@ class BaseTrainer(Stateful, ABC):
         self, outputs: ModelOutput, micro_batch: Dict[str, torch.Tensor]
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Postprocess model outputs after forward pass."""
+        losses = outputs.loss
+        aux_loss = getattr(outputs, "aux_loss", None)
+        router_aux_loss_coef = self._get_router_aux_loss_coef() if isinstance(aux_loss, torch.Tensor) else None
+
+        if isinstance(aux_loss, torch.Tensor) and router_aux_loss_coef is not None:
+            # HF MoE models include router auxiliary loss in outputs.loss. Remove
+            # it here and add it back with the same global-batch scaling used by
+            # non-token losses, otherwise aux logging and weighting depend on GA/SP.
+            if isinstance(losses, torch.Tensor):
+                aux_contribution = aux_loss.to(losses.device) * router_aux_loss_coef
+                losses = losses - aux_contribution
+            elif isinstance(losses, dict) and "foundation_loss" in losses:
+                losses = dict(losses)
+                aux_contribution = aux_loss.to(losses["foundation_loss"].device) * router_aux_loss_coef
+                losses["foundation_loss"] = losses["foundation_loss"] - aux_contribution
+
         loss_dict: Dict[str, torch.Tensor] = mean_global_loss(
-            outputs.loss, self.micro_batch_token_len, self.micro_batches_token_len
+            losses, self.micro_batch_token_len, self.micro_batches_token_len
         )
         loss = torch.stack(list(loss_dict.values())).sum()
+
+        if isinstance(aux_loss, torch.Tensor):
+            aux_weight = global_loss_weight("foundation", self.micro_batch_token_len, self.micro_batches_token_len)
+            normalized_aux_loss = aux_loss * aux_weight
+            loss_dict["load_balancing_loss"] = normalized_aux_loss.detach()
+            if router_aux_loss_coef is not None:
+                weighted_aux_loss = normalized_aux_loss * router_aux_loss_coef
+                loss_dict["load_balancing_loss_weighted"] = weighted_aux_loss.detach()
+                loss = loss + weighted_aux_loss
         return loss, loss_dict
+
+    def _get_router_aux_loss_coef(self) -> float | None:
+        """Return the router auxiliary loss coefficient for dense or wrapped MoE configs."""
+        for config in (self.model_config, getattr(self.model_config, "text_config", None)):
+            if config is None:
+                continue
+            coef = getattr(config, "router_aux_loss_coef", None)
+            if coef is not None:
+                return float(coef)
+        return None
 
     def forward_backward_step(
         self, micro_batch: dict[str, torch.Tensor]

@@ -106,18 +106,25 @@ Core files:
     - `PackingCollator` sets `IGNORE_INDEX` on the first token of each packed sample (after the first) to prevent cross-sample supervision.
     - Custom data transforms must preserve this convention.
 
-13. **SP collation ordering is load-bearing**
+13. **Non-token auxiliary losses must use global-batch scaling**
+    - Losses produced once per micro-batch, such as MoE router auxiliary loss, must be scaled with the same global-batch weight as `mean_global_loss()`.
+    - Do not log or backprop raw per-micro-batch auxiliary losses directly; their values will depend on gradient accumulation and sequence parallelism.
+    - If a HuggingFace model already includes the auxiliary loss in `outputs.loss`, split it out before global loss normalization and add it back with the same scaled weight.
+    - SP-aware MoE router auxiliary loss must aggregate sufficient statistics (`expert_count`, `router_prob_sum`, `total_weight`) across the SP group before applying the nonlinear aux formula; averaging per-rank aux losses is numerically wrong.
+    - Do not reuse SP-padded `attention_mask` as the real-token mask for router auxiliary loss. Preserve a separate zero-padded router mask when aux loss must exclude SP padding tokens.
+
+14. **SP collation ordering is load-bearing**
     - `SequenceParallelCollator` executes in strict order: pad → slice batch tensors → compute FA kwargs on **full** `position_ids` → slice `position_ids` last.
     - Reordering causes incorrect `cu_seq_lens` or misaligned position/label tensors.
 
-14. **Dynamic batching packs samples by token budget**
+15. **Dynamic batching packs samples by token budget**
     - `DynamicBatchingSizeDataset` (preferred) / `DynBszBuffer` (legacy): per-worker buffer, yields when token sum ≥ `micro_batch_seq_length`.
     - `_get_micro_batch` greedily adds samples that fit. Supports `state_dict` / `load_state_dict` for checkpoint resumption.
     - Position IDs in packed sequences must encode segment boundaries (see constraint 10).
 
 ### Multimodal Data
 
-15. **Multimodal preprocessing pipeline (`veomni/data/multimodal/`)**
+16. **Multimodal preprocessing pipeline (`veomni/data/multimodal/`)**
     - `encode_multimodal_sample()` in `multimodal_transform.py` orchestrates: `conv_preprocess()` → `fetch_images/videos/audios` → `process_mm_data()` → processor tokenization.
     - Images: load → RGB PIL → `smart_resize` (pixel min/max, scale_factor for grid alignment, max aspect ratio).
     - Videos: `torchcodec` decode → `calculate_frame_indices` (FPS, min/max frames, `frame_factor`/`frame_factor_remainder` for VAE-friendly counts); optional paired audio.
@@ -126,34 +133,34 @@ Core files:
 
 ## Checkpoint
 
-16. **DCP checkpoint keys must match model state dict**
+17. **DCP checkpoint keys must match model state dict**
     - `veomni/checkpoint/dcp_checkpointer.py` uses PyTorch's DCP (`torch.distributed.checkpoint`).
     - Renaming model parameters or changing the model structure between save and load breaks checkpoint loading.
     - Extra state is saved per-rank via `_EXTRA_STATE_FORMAT` — changing rank count requires checkpoint resharding.
 
-17. **Checkpoint save/load requires all ranks to participate**
+18. **Checkpoint save/load requires all ranks to participate**
     - DCP operations are collective — all ranks must call save/load simultaneously.
     - Calling checkpoint operations from only rank 0 causes deadlocks.
 
 ## Code Quality
 
-18. **Ruff must pass before commit**
+19. **Ruff must pass before commit**
     - `make quality` runs `ruff check` and `ruff format --check`.
     - Pre-commit hooks enforce this automatically (`pre-commit run --all-files`).
 
-19. **All comments and docstrings must be in English**
+20. **All comments and docstrings must be in English**
     - No Chinese or other non-English text in code comments. This is enforced by project convention.
 
-20. **PR title must follow format: `[{modules}] {type}: {description}`**
+21. **PR title must follow format: `[{modules}] {type}: {description}`**
     - Allowed modules and types are defined in `.github/workflows/check_pr_title.yml` (single source of truth).
     - CI checks PR titles automatically on every PR.
 
 ## Hardware
 
-21. **NPU (Ascend) code paths require guards**
+22. **NPU (Ascend) code paths require guards**
     - NPU-specific code must be guarded with `is_torch_npu_available()` or `IS_NPU_AVAILABLE`.
     - NPU kernels live in `veomni/ops/kernels/{rms_norm,rotary}/npu.py` and `veomni/ops/platform/npu/` — they must not be imported on GPU-only environments.
 
-22. **Device-agnostic code must use `veomni.utils.device` helpers**
+23. **Device-agnostic code must use `veomni.utils.device` helpers**
     - Use `get_device_type()`, `get_torch_device()`, `synchronize()`, `empty_cache()` instead of direct `torch.cuda.*` calls.
     - Direct CUDA calls break NPU compatibility.
