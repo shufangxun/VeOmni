@@ -24,45 +24,10 @@ VeOmni targets Python 3.11 and transformers v5. The training shell also
 prepends `.venv/bin` to `PATH`, so using `export PATH=...` is enough even when
 the virtualenv activation script is not present.
 
-Before launching training, prepare these local paths:
-
-- OpenPangu-VL HuggingFace remote-code assets. The default config uses
-  `/root/shufangxun/Verl-Pangu30B/models/pangu30b_vl_clean` for
-  `model.config_path` and `model.tokenizer_path`.
-- Local prepared training shards referenced by
-  `configs/multimodal/data/qwen3_siglip_stage2_full.yaml`.
-- A writable experiment directory. The default is
-  `exp/openpangu-vl-30a3b-sft`.
-
-The default training config is:
-
-```text
-configs/multimodal/openpangu_vl/30a3b/stage2_full.yaml
-```
-
-The default shell entrypoint is:
-
-```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3 NPROC_PER_NODE=4 \
-  bash shells/multimodal/panguvl_moe/stage2_full.sh
-```
-
-`NPROC_PER_NODE` should match the number of visible GPUs. The default
-`train.accelerator.ep_size: 2` must divide the total distributed world size.
-If W&B is enabled in the config, set `WANDB_API_KEY` or run `wandb login`; the
-default OpenPangu-VL config keeps W&B disabled.
-
-For a quick end-to-end smoke run, keep checkpoints off and stop after a few
-steps:
-
-```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3 NPROC_PER_NODE=4 \
-  bash shells/multimodal/panguvl_moe/stage2_full.sh \
-  --train.max_steps 2 \
-  --train.checkpoint.save_steps 0 \
-  --train.checkpoint.save_hf_weights false \
-  --train.wandb.enable false
-```
+OpenPangu-VL can be trained with different recipes, such as connector-only
+warmup, full-parameter multimodal training, frozen vision/text components, or
+scratch versus checkpoint initialization. This guide uses stage-2
+full-parameter training as the concrete example.
 
 ## Data Preparation
 
@@ -145,6 +110,27 @@ For text-only SFT, keep the same `conversations` field and omit `image`.
 Raw Tulu records use `messages`; convert them offline to this ShareGPT
 `conversations` schema, or the `conversation` transform will reject them.
 
+For image QA/SFT, the `image` field can be either:
+
+- a HuggingFace-style image struct, `{"bytes": <binary>, "path": null}`;
+- a path-backed struct, `{"bytes": null, "path": "/path/to/image.jpg"}`;
+- a plain local path string.
+
+The number of `<image>` placeholders in `conversations` must match the number
+of images loaded from `image` or `images`. During OpenPangu-VL preprocessing,
+VeOmni normalizes the image entry to bytes or path, loads it as RGB, runs the
+OpenPangu-VL image processor, and produces `pixel_values` plus
+`image_grid_thw`. The chat template then replaces each `<image>` placeholder
+with OpenPangu-VL vision tokens:
+
+```text
+<|vision_start|><|image_pad|>...<|image_pad|><|vision_end|>
+```
+
+The number of `<|image_pad|>` tokens comes from `image_grid_thw` and the image
+processor merge size. The transform also builds `image_mask`, masks image token
+labels with `IGNORE_INDEX`, and computes OpenPangu-VL 3D `position_ids`.
+
 `interleaved` image-text pretraining:
 
 ```json
@@ -169,11 +155,21 @@ weighted mixer does not apply a second modulo shard.
 
 ## Training Configuration
 
-The OpenPangu-VL stage-2 config is:
+This guide uses the OpenPangu-VL stage-2 full-parameter config:
 
 ```text
 configs/multimodal/openpangu_vl/30a3b/stage2_full.yaml
 ```
+
+Launch it with:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 NPROC_PER_NODE=4 \
+  bash shells/multimodal/panguvl_moe/stage2_full.sh
+```
+
+`NPROC_PER_NODE` should match the number of visible GPUs. The default
+`train.accelerator.ep_size: 2` must divide the total distributed world size.
 
 Important fields:
 
@@ -348,9 +344,23 @@ inference path if the converted checkpoint does not fit on one device.
 
 ## Monitoring
 
-`train.moe_load_balance_monitor_interval` controls MaxVio logging when W&B is
-enabled. Aux-free balancing does not require W&B; the expert-count all-reduce is
-small, with payload size roughly:
+W&B is optional and controlled by `train.wandb.enable`. When enabled, VeOmni
+logs coarse training metrics and finer-grained multimodal/MoE signals:
+
+- `training/*`: total loss, foundation loss, gradient norm, and learning rate.
+- `source_loss/*`: per-source loss, perplexity, and token counts. These map to
+  the `names` entries in the multi-source data YAML.
+- `domain_loss/*`: per-domain loss, perplexity, and token counts. These map to
+  the `domains` entries such as `caption`, `interleaved`, `qa`, `text_web`,
+  `text_knowledge`, and `text_sft`.
+- `perf/*`: throughput and MFU-style performance counters.
+- `memory/*`: GPU and CPU memory usage.
+- MoE load-balance metrics: MaxVio and related expert-utilization summaries
+  when `train.moe_load_balance_monitor_interval` is non-zero.
+
+`train.moe_load_balance_monitor_interval` controls MaxVio logging frequency.
+Aux-free balancing does not require W&B; the expert-count all-reduce is small,
+with payload size roughly:
 
 ```text
 num_moe_layers * n_routed_experts * sizeof(float32)
@@ -358,3 +368,9 @@ num_moe_layers * n_routed_experts * sizeof(float32)
 
 For a 25-layer, 256-expert model this is about 25.6 KB per training step, which
 is negligible compared with FSDP and MoE token-exchange communication.
+
+## TODO
+
+- Add Muon optimizer support for OpenPangu-VL recipes.
+- Add video data and video processor support.
+- Add layer-wise learning-rate configuration for multimodal fine-tuning.
