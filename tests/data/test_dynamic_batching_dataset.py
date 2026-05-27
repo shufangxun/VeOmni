@@ -34,6 +34,7 @@ import subprocess
 import sys
 from contextlib import nullcontext
 from dataclasses import asdict
+from types import SimpleNamespace
 from typing import Any, Dict, List
 from unittest.mock import patch
 
@@ -60,7 +61,7 @@ from utils import (
 from veomni.arguments import VeOmniArguments, parse_args
 from veomni.data import build_dataloader
 from veomni.data.data_collator import MainCollator
-from veomni.data.dataset import DynamicBatchingSizeDataset
+from veomni.data.dataset import DYNAMIC_BATCH_OVERLONG_SKIP_STATS_KEY, DynamicBatchingSizeDataset
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.trainer.base import BaseTrainer
 from veomni.trainer.callbacks import Callback, EnvironMeterCallback, TrainerState
@@ -209,6 +210,83 @@ def test_dynamic_batching_basic(shuffle, seed):
 
     assert batch_count > 0, "Should produce at least one batch"
     logger.info(f"test_dynamic_batching_basic (shuffle={shuffle}) passed! Produced {batch_count} batches")
+
+
+def test_overlong_skip_stats_are_recorded_and_restored():
+    iterable_ds = ShardedIterableDataset(size=40, shuffle=False)
+    dynamic_ds = DynamicBatchingSizeDataset(
+        dataset=iterable_ds,
+        micro_batch_seq_length=MICRO_BATCH_SEQ_LENGTH,
+        ready_for_micro_batch_threshold=READY_FOR_MICRO_BATCH_THRESHOLD,
+        dynamic_batching_collate_fn=MainCollator(),
+        get_length_fn=get_length_fn,
+    )
+
+    batches = list(dynamic_ds)
+
+    expected_stats = {
+        "seen_samples": 40,
+        "skipped_samples": 8,
+        "skipped_tokens": sum(range(33, 41)),
+        "max_skipped_length": 40,
+    }
+    assert dynamic_ds.overlong_skip_stats == expected_stats
+    assert dynamic_ds.state_dict()["overlong_skip_stats"] == expected_stats
+    assert sum(batch[DYNAMIC_BATCH_OVERLONG_SKIP_STATS_KEY]["seen_samples"] for batch in batches) == 40
+    assert sum(batch[DYNAMIC_BATCH_OVERLONG_SKIP_STATS_KEY]["skipped_samples"] for batch in batches) == 8
+    assert max(batch[DYNAMIC_BATCH_OVERLONG_SKIP_STATS_KEY]["max_skipped_length"] for batch in batches) == 40
+
+    restored_ds = DynamicBatchingSizeDataset(
+        dataset=ShardedIterableDataset(size=40, shuffle=False),
+        micro_batch_seq_length=MICRO_BATCH_SEQ_LENGTH,
+        ready_for_micro_batch_threshold=READY_FOR_MICRO_BATCH_THRESHOLD,
+        dynamic_batching_collate_fn=MainCollator(),
+        get_length_fn=get_length_fn,
+    )
+    restored_ds.load_state_dict(dynamic_ds.state_dict())
+    assert restored_ds.overlong_skip_stats == expected_stats
+
+
+def test_environ_meter_reports_overlong_skip_metrics(monkeypatch):
+    class FakeTorchDevice:
+        @staticmethod
+        def max_memory_allocated():
+            return 0
+
+        @staticmethod
+        def max_memory_reserved():
+            return 0
+
+        @staticmethod
+        def memory_stats():
+            return {"num_alloc_retries": 0}
+
+    monkeypatch.setattr(helper.dist, "get_world_size", lambda: 1)
+    monkeypatch.setattr(helper, "get_parallel_state", lambda: SimpleNamespace(dp_group=None))
+    monkeypatch.setattr(helper, "get_torch_device", lambda: FakeTorchDevice)
+    monkeypatch.setattr(helper, "all_reduce", lambda data, op="mean", group=None: data)
+
+    meter = helper.EnvironMeter(config=PretrainedConfig(), global_batch_size=1, empty_cache_steps=0)
+    meter.estimate_flops = lambda seqlens, delta_time, images_seqlens=None: (0, 1)
+    micro_batch = {
+        "attention_mask": torch.ones((1, 4), dtype=torch.long),
+        DYNAMIC_BATCH_OVERLONG_SKIP_STATS_KEY: {
+            "seen_samples": 5,
+            "skipped_samples": 2,
+            "skipped_tokens": 17,
+            "max_skipped_length": 9,
+        },
+    }
+
+    meter.add(micro_batch)
+    metrics = meter.step(delta_time=1.0, global_step=1)
+
+    assert DYNAMIC_BATCH_OVERLONG_SKIP_STATS_KEY not in micro_batch
+    assert metrics["data/overlong_seen_samples"] == 5
+    assert metrics["data/overlong_skipped_samples"] == 2
+    assert metrics["data/overlong_skip_ratio"] == 0.4
+    assert metrics["data/overlong_cumulative_skip_ratio"] == 0.4
+    assert meter.state_dict()["overlong_skip_stats"]["skipped_samples"] == 2
 
 
 def test_last_batch_on_dataset_end(setup_dynamic_batching_dataset):

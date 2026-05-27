@@ -97,6 +97,12 @@ def _validate_image_placeholder_alignment(
         )
 
 
+def _resolve_domain_name(example: Dict[str, Any], domain: str = None) -> Any:
+    if domain is not None:
+        return domain
+    return example.get("domain_name", example.get("domain"))
+
+
 @DATA_TRANSFORM_REGISTRY.register("plaintext")
 def process_plaintext_example(
     example: Dict[str, Any],
@@ -106,7 +112,7 @@ def process_plaintext_example(
     **kwargs,
 ) -> List[Dict[str, Any]]:
     examples = []
-    domain_name = example.get("domain_name", example.get("domain"))
+    domain_name = _resolve_domain_name(example, kwargs.get("domain"))
     if isinstance(text_keys, str):
         text_example = example[text_keys]
     elif isinstance(text_keys, list):
@@ -141,7 +147,7 @@ def process_conversation_example(
     text_keys: Union[str, List[str]] = "messages",
     **kwargs,
 ) -> List[Dict[str, "torch.Tensor"]]:
-    domain_name = example.get("domain_name", example.get("domain"))
+    domain_name = _resolve_domain_name(example, kwargs.get("domain"))
     if isinstance(text_keys, str):
         text_example = example[text_keys]
     elif isinstance(text_keys, list):
@@ -186,7 +192,7 @@ def process_mixed_text_example(
             f"Unsupported mixed_text preprocess: {preprocess}. Supported values are: plaintext, conversation."
         )
 
-    domain_name = example.get("domain_name", example.get("domain"))
+    domain_name = _resolve_domain_name(example, kwargs.get("domain"))
     examples = []
     for tokenized_example in tokenized_examples:
         processed_example = {k: torch.tensor(v) for k, v in tokenized_example.items()}
@@ -370,7 +376,6 @@ def _process_sample_qwen_vl_base(
 ):
     from .multimodal import conv_preprocess
     from .multimodal.image_utils import fetch_images
-    from .multimodal.video_utils import fetch_videos_metadata
 
     source = kwargs.get("source_name") or sample.get("source") or sample.get("source_name")
 
@@ -393,6 +398,8 @@ def _process_sample_qwen_vl_base(
         token_num_inputs["image"] = image_token_num
 
     if "videos" in sample and sample["videos"]:
+        from .multimodal.video_utils import fetch_videos_metadata
+
         videos, metadata, _, _ = fetch_videos_metadata(sample["videos"], **kwargs)
         video_inputs = processor.video_processor(
             videos=videos, video_metadata=metadata, return_tensors="pt", return_metadata=True
@@ -686,7 +693,7 @@ def process_sample_qwen3_siglip_vlm(
             )
         ]
 
-    domain_name = sample.get("domain_name", sample.get("domain", domain))
+    domain_name = _resolve_domain_name(sample, domain)
     examples = []
     for tokenized_example in tokenized_examples:
         processed_example = {
@@ -702,6 +709,137 @@ def process_sample_qwen3_siglip_vlm(
             input_ids=processed_example["input_ids"].unsqueeze(0),
             attention_mask=attention_mask.unsqueeze(0),
         )["position_ids"].squeeze(0)
+        if image_inputs:
+            processed_example.update(image_inputs)
+        if domain_name is not None:
+            processed_example["domain_name"] = str(domain_name)
+        examples.append(processed_example)
+    return examples
+
+
+def _process_openpangu_vl_images(
+    image_items: List[Any],
+    processor: "ProcessorMixin",
+    **kwargs,
+) -> tuple[Dict[str, torch.Tensor], Union[torch.Tensor, None], List[int]]:
+    from .multimodal.image_utils import fetch_images
+
+    if not image_items:
+        return {}, None, []
+
+    images = fetch_images(image_items, **kwargs)
+    image_inputs = processor.image_processor(images=images, return_tensors="pt")
+    image_grid_thw = image_inputs["image_grid_thw"]
+    merge_length = processor.image_processor.merge_size**2
+    image_token_nums = (image_grid_thw.prod(dim=-1) // merge_length).tolist()
+    return image_inputs, image_grid_thw, [int(token_num) for token_num in image_token_nums]
+
+
+def _squeeze_openpangu_position_ids(position_ids: torch.Tensor) -> torch.Tensor:
+    if position_ids.ndim == 3 and position_ids.shape[1] == 1:
+        return position_ids.squeeze(1).clone()
+    if position_ids.ndim == 2 and position_ids.shape[0] == 1:
+        return position_ids.squeeze(0).clone()
+    return position_ids.clone()
+
+
+@DATA_TRANSFORM_REGISTRY.register("openpangu_vl")
+@DATA_TRANSFORM_REGISTRY.register("pangu_vl")
+def process_sample_openpangu_vl(
+    sample: Dict[str, Any],
+    processor: "ProcessorMixin",
+    chat_template: "ChatTemplate",
+    position_id_func: "Callable",
+    max_seq_len: int,
+    text_keys: Union[str, List[str], None] = None,
+    image_keys: Union[str, List[str], None] = None,
+    preprocess: str = None,
+    domain: str = None,
+    **kwargs,
+):
+    if preprocess is None:
+        raise ValueError("openpangu_vl requires per-source preprocess from multisource data yaml.")
+
+    image_items = []
+    if preprocess == "plaintext":
+        text_example = _get_text_example(sample, text_keys or "text")
+        tokenized_examples = chat_template.encode_pretrain_text(text_example, max_seq_len=max_seq_len)
+    elif preprocess == "conversation":
+        raw_conversations = _get_text_example(sample, text_keys or "conversations")
+        conversations = _sharegpt_conversation_to_multimodal_conversation(raw_conversations)
+        image_items = _extract_image_items(sample, image_keys)
+        _validate_image_placeholder_alignment(
+            preprocess=preprocess,
+            placeholder_count=_count_image_placeholders(conversations),
+            loaded_image_count=len(image_items),
+        )
+    elif preprocess == "interleaved":
+        conversations, image_items = _build_qwen3_siglip_interleaved_from_aligned_lists(
+            sample,
+            text_keys,
+            image_keys,
+        )
+        _validate_image_placeholder_alignment(
+            preprocess=preprocess,
+            placeholder_count=_count_image_placeholders(conversations),
+            loaded_image_count=len(image_items),
+        )
+    else:
+        raise ValueError(
+            f"Unsupported openpangu_vl preprocess: {preprocess}. Supported values are: "
+            "plaintext, conversation, interleaved."
+        )
+
+    try:
+        image_inputs, image_grid_thw, image_token_nums = _process_openpangu_vl_images(
+            image_items,
+            processor,
+            **kwargs,
+        )
+    except OSError as exc:
+        logger.warning(
+            "Skip openpangu_vl sample with unreadable image: "
+            f"id={sample.get('id')}, preprocess={preprocess}, domain={sample.get('domain', domain)}, "
+            f"image_count={len(image_items)}, error={exc}"
+        )
+        return None
+
+    if preprocess == "conversation":
+        tokenized_examples = [
+            chat_template.encode_messages(conversations, {"image": image_token_nums}, max_seq_len=max_seq_len)
+        ]
+    elif preprocess == "interleaved":
+        tokenized_examples = [
+            chat_template.encode_interleaved_messages(
+                conversations,
+                {"image": image_token_nums},
+                max_seq_len=max_seq_len,
+            )
+        ]
+
+    domain_name = _resolve_domain_name(sample, domain)
+    examples = []
+    for tokenized_example in tokenized_examples:
+        processed_example = {
+            k: (v if isinstance(v, torch.Tensor) else torch.tensor(v)) for k, v in tokenized_example.items()
+        }
+        input_ids = processed_example["input_ids"]
+        attention_mask = processed_example["attention_mask"]
+        image_mask = input_ids == IMAGE_INPUT_INDEX
+        video_mask = input_ids == VIDEO_INPUT_INDEX
+        position_output = position_id_func(
+            input_ids=input_ids.unsqueeze(0),
+            image_grid_thw=image_grid_thw,
+            video_grid_thw=None,
+            attention_mask=attention_mask.unsqueeze(0),
+        )
+
+        processed_example["image_mask"] = image_mask
+        processed_example["video_mask"] = video_mask
+        processed_example["position_ids"] = _squeeze_openpangu_position_ids(position_output["position_ids"])
+        processed_example["input_ids"] = input_ids.clone()
+        processed_example["input_ids"][image_mask] = 0
+        processed_example["input_ids"][video_mask] = 0
         if image_inputs:
             processed_example.update(image_inputs)
         if domain_name is not None:

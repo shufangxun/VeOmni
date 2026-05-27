@@ -518,6 +518,7 @@ class BaseTrainer(Stateful, ABC):
 
     def preforward(self, micro_batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Preprocess micro batches before forward pass."""
+        micro_batch.pop("_dynamic_batch_overlong_skip_stats", None)
         micro_batch.pop("domain_name", None)
         micro_batch.pop("domain", None)
         micro_batch = {
@@ -536,11 +537,14 @@ class BaseTrainer(Stateful, ABC):
         losses = outputs.loss
         aux_loss = getattr(outputs, "aux_loss", None)
         router_aux_loss_coef = self._get_router_aux_loss_coef() if isinstance(aux_loss, torch.Tensor) else None
+        use_router_aux_loss = self._use_router_aux_loss(router_aux_loss_coef)
 
         if isinstance(aux_loss, torch.Tensor) and router_aux_loss_coef is not None:
             # HF MoE models include router auxiliary loss in outputs.loss. Remove
             # it here and add it back with the same global-batch scaling used by
-            # non-token losses, otherwise aux logging and weighting depend on GA/SP.
+            # non-token losses if the selected load-balance strategy uses aux loss.
+            # This keeps train.moe_load_balance_strategy='none' and 'aux_free' from
+            # silently retaining the model-added router aux loss.
             if isinstance(losses, torch.Tensor):
                 aux_contribution = aux_loss.to(losses.device) * router_aux_loss_coef
                 losses = losses - aux_contribution
@@ -558,11 +562,23 @@ class BaseTrainer(Stateful, ABC):
             aux_weight = global_loss_weight("foundation", self.micro_batch_token_len, self.micro_batches_token_len)
             normalized_aux_loss = aux_loss * aux_weight
             loss_dict["load_balancing_loss"] = normalized_aux_loss.detach()
-            if router_aux_loss_coef is not None:
+            if use_router_aux_loss:
                 weighted_aux_loss = normalized_aux_loss * router_aux_loss_coef
                 loss_dict["load_balancing_loss_weighted"] = weighted_aux_loss.detach()
                 loss = loss + weighted_aux_loss
         return loss, loss_dict
+
+    def _get_moe_load_balance_strategy(self) -> str:
+        train_args = getattr(getattr(self, "args", None), "train", None)
+        strategy = getattr(train_args, "moe_load_balance_strategy", "auto")
+        if getattr(train_args, "moe_aux_free_load_balance", False) and strategy == "auto":
+            return "aux_free"
+        return strategy
+
+    def _use_router_aux_loss(self, router_aux_loss_coef: float | None) -> bool:
+        if router_aux_loss_coef is None:
+            return False
+        return self._get_moe_load_balance_strategy() in {"auto", "aux_loss"}
 
     def _get_router_aux_loss_coef(self) -> float | None:
         """Return the router auxiliary loss coefficient for dense or wrapped MoE configs."""

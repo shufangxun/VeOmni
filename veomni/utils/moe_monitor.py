@@ -14,15 +14,15 @@
 
 """MoE Router Load Balance Monitor.
 
-Provides tools to monitor expert load distribution across MoE layers during training.
-Logs the batch-level MaxVio metric averaged across MoE layers to wandb.
+Provides tools to monitor expert load distribution across MoE layers during training
+and to update auxiliary-loss-free expert router biases.
 
 Architecture:
-    1. Router modules (e.g. PatchQwen3MoeTopKRouter) register ``router_forward_hook``
-       in their ``__init__``. This happens at model construction time.
-    2. The hook is a no-op (single ``if`` check) until a ``MoERouterMonitor`` is
+    1. Router modules either register ``router_forward_hook`` or directly call
+       ``MoERouterMonitor.record()`` after top-k routing.
+    2. Recording is a no-op (single ``if`` check) until a ``MoERouterMonitor`` is
        created and activated via ``set_active_monitor()``. This is done by the
-       trainer when ``moe_load_balance_monitor_interval > 0``.
+       trainer when MoE monitoring or aux-free balancing is enabled.
     3. Once active, each router forward accumulates token-to-expert counts on device.
        At the end of each training step, ``get_load_matrix()`` moves counts to CPU
        and produces a normalized frequency matrix for that training batch.
@@ -104,10 +104,9 @@ def ensure_router_monitor_hooks(model: nn.Module) -> int:
 class MoERouterMonitor:
     """Monitors MoE expert load distribution via router forward hooks.
 
-    Router modules register ``router_forward_hook`` at construction time (in the
-    model patch, e.g. ``PatchQwen3MoeTopKRouter.__init__``). The hook is a no-op
-    until a monitor is activated via ``set_active_monitor()``. This avoids FSDP
-    compatibility issues and module-walking entirely.
+    Router modules either register ``router_forward_hook`` at construction time
+    or call ``record()`` directly after top-k routing. Both paths are no-ops
+    until a monitor is activated via ``set_active_monitor()``.
 
     Typical usage (via ``MoERouterMonitorCallback``)::
 
@@ -138,6 +137,7 @@ class MoERouterMonitor:
         # Maps module id -> accumulated token counts tensor (on device, shape [num_experts]).
         # Using id(module) as key so we can track each router instance independently.
         self._counts: Dict[int, torch.Tensor] = {}
+        self._modules: Dict[int, nn.Module] = {}
         # Ordered list of module ids, preserving layer discovery order (layer 0 first).
         self._layer_order: list = []
         # Step range tracking for heatmap captions.
@@ -154,11 +154,14 @@ class MoERouterMonitor:
             module: The router module instance (used as key via ``id(module)``).
             router_indices: Expert indices of shape ``[num_tokens, top_k]``.
         """
+        if not module.training:
+            return
         mid = id(module)
         # Lazily initialize the counts tensor for new router modules.
         # The first forward pass through each router auto-registers it.
         if mid not in self._counts:
             self._layer_order.append(mid)
+            self._modules[mid] = module
             device = router_indices.device
             self._counts[mid] = torch.zeros(self.num_experts, dtype=torch.long, device=device)
         # Count how many tokens were routed to each expert.
@@ -168,6 +171,80 @@ class MoERouterMonitor:
         )
         # Accumulate on device — detach to avoid graph retention.
         self._counts[mid] += counts.detach()
+
+    def drain_counts(
+        self,
+        current_step: int = 0,
+        global_reduce: bool = True,
+    ) -> tuple[torch.Tensor, list[nn.Module]]:
+        """Return raw per-layer expert counts and reset accumulated state.
+
+        Args:
+            current_step: The current global training step.
+            global_reduce: Whether to sum counts across the default process group.
+
+        Returns:
+            ``(counts, modules)`` where ``counts`` is shaped
+            ``[num_moe_layers, num_experts]`` and ``modules`` is aligned with
+            the first dimension. ``counts`` stays on device so callers can use
+            it for no-grad bias updates without a CPU sync.
+        """
+        if not self._counts:
+            return torch.zeros(0, self.num_experts), []
+        self._accumulate_end_step = current_step
+        modules = [self._modules[mid] for mid in self._layer_order]
+        matrix = torch.stack([self._counts[mid] for mid in self._layer_order]).float()
+        if global_reduce and dist.is_available() and dist.is_initialized():
+            dist.all_reduce(matrix, op=dist.ReduceOp.SUM)
+        self._last_step_range = (self._accumulate_start_step, self._accumulate_end_step)
+        self._reset_counts()
+        self._accumulate_start_step = current_step + 1
+        return matrix, modules
+
+    @staticmethod
+    def counts_to_load_matrix(counts: torch.Tensor) -> torch.Tensor:
+        """Normalize raw expert counts into per-layer load frequencies."""
+        if counts.numel() == 0:
+            return counts.detach().cpu()
+        matrix = counts.detach().cpu()
+        row_sums = matrix.sum(dim=1, keepdim=True).clamp(min=1.0)
+        return matrix / row_sums
+
+    @staticmethod
+    @torch.no_grad()
+    def update_aux_free_bias(
+        counts: torch.Tensor,
+        modules: list[nn.Module],
+        update_rate: float,
+        return_metrics: bool = False,
+    ) -> dict[str, float]:
+        """Apply auxiliary-loss-free per-expert bias updates.
+
+        The update follows Wang et al. (2024): ``b_i += u * sign(avg(c) - c_i)``.
+        Only modules with an ``e_score_correction_bias`` buffer are updated.
+        """
+        if counts.numel() == 0 or update_rate <= 0:
+            return {}
+
+        updated_layers = 0
+        max_abs_bias = 0.0
+        for layer_counts, module in zip(counts, modules):
+            bias = getattr(module, "e_score_correction_bias", None)
+            if not isinstance(bias, torch.Tensor):
+                continue
+            layer_counts = layer_counts.to(device=bias.device, dtype=bias.dtype)
+            error = layer_counts.mean() - layer_counts
+            bias.add_(float(update_rate) * error.sign())
+            updated_layers += 1
+            if return_metrics:
+                max_abs_bias = max(max_abs_bias, float(bias.detach().abs().max().item()))
+
+        if updated_layers == 0:
+            return {}
+        metrics = {"moe/aux_free_bias_updated_layers": float(updated_layers)}
+        if return_metrics:
+            metrics["moe/aux_free_bias_max_abs"] = max_abs_bias
+        return metrics
 
     def get_load_matrix(self, current_step: int = 0, global_reduce: bool = True) -> torch.Tensor:
         """Return the normalized load matrix and reset accumulated counts.
@@ -190,22 +267,8 @@ class MoERouterMonitor:
             row sums to 1.0, representing the fraction of tokens routed to each
             expert in that layer.
         """
-        if not self._counts:
-            return torch.zeros(0, self.num_experts)
-        self._accumulate_end_step = current_step
-        matrix = torch.stack([self._counts[mid] for mid in self._layer_order]).float()
-        if global_reduce and dist.is_available() and dist.is_initialized():
-            dist.all_reduce(matrix, op=dist.ReduceOp.SUM)
-        # Move to CPU after the optional global reduction (single sync point).
-        matrix = matrix.cpu()
-        # Normalize each row (layer) to sum to 1.0.
-        row_sums = matrix.sum(dim=1, keepdim=True).clamp(min=1.0)
-        matrix = matrix / row_sums
-        # Save step range for caption, then reset for next interval.
-        self._last_step_range = (self._accumulate_start_step, self._accumulate_end_step)
-        self._reset_counts()
-        self._accumulate_start_step = current_step + 1
-        return matrix
+        counts, _ = self.drain_counts(current_step=current_step, global_reduce=global_reduce)
+        return self.counts_to_load_matrix(counts)
 
     def create_wandb_image(self, load_matrix: torch.Tensor, caption: str = None):
         """Create a wandb.Image heatmap from the normalized load matrix.

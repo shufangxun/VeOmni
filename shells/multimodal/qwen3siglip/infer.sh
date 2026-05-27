@@ -15,6 +15,3 @@
      --max-new-tokens 100 \
      --device cuda \
      --dtype bfloat16
-
-
-     # --question "The capital of France is" \

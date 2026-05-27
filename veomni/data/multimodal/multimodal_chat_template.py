@@ -1111,6 +1111,216 @@ class SiglipQwen3ChatTemplate(MultimodalChatTemplate):
         return tokenized_example
 
 
+class OpenPanguVLChatTemplate(MultimodalChatTemplate):
+    def __init__(self, tokenizer: PreTrainedTokenizer, **kwargs) -> None:
+        super().__init__(tokenizer)
+        del kwargs
+        self.image_pad = "<|image_pad|>"
+        self.video_pad = "<|video_pad|>"
+        self.vision_start_token = "<|vision_start|>"
+        self.vision_end_token = "<|vision_end|>"
+        self.text_start_token = "<|pangu_text_start|>"
+        self.message_start_token = "<|message_start|>"
+        self.message_end_token = "<|message_end|>"
+
+        self.image_token_id = self.tokenizer.convert_tokens_to_ids(self.image_pad)
+        self.video_token_id = self.tokenizer.convert_tokens_to_ids(self.video_pad)
+        self.image_start_id = self.tokenizer.convert_tokens_to_ids(self.vision_start_token)
+        self.image_end_id = self.tokenizer.convert_tokens_to_ids(self.vision_end_token)
+
+        self._role_names = {
+            "assistant": "\u52a9\u624b",
+            "system": "\u7cfb\u7edf",
+            "user": "\u7528\u6237",
+            "tool": "\u5de5\u5177",
+            "function": "\u65b9\u6cd5",
+        }
+        self.tokenizer.chat_template = self.get_jinja_template()
+
+        logger.info_rank0("OpenPanguVLTemplate will not truncate sequence when longer than [max_seq_lens].")
+
+    def _role_name(self, role: str) -> str:
+        return self._role_names.get(role, role)
+
+    def image_pattern(self, token_num: int) -> str:
+        return self.vision_start_token + self.image_pad * int(token_num) + self.vision_end_token
+
+    def video_pattern(self, token_num: int) -> str:
+        return self.vision_start_token + self.video_pad * int(token_num) + self.vision_end_token
+
+    def get_jinja_template(self) -> str:
+        return (
+            "{% macro role_name(role) -%}"
+            "{%- if role == 'assistant' -%}\u52a9\u624b"
+            "{%- elif role == 'system' -%}\u7cfb\u7edf"
+            "{%- elif role == 'user' -%}\u7528\u6237"
+            "{%- elif role == 'tool' -%}\u5de5\u5177"
+            "{%- elif role == 'function' -%}\u65b9\u6cd5"
+            "{%- else -%}{{ role }}{%- endif -%}"
+            "{%- endmacro %}"
+            "{% set image_count = namespace(value=0) %}"
+            "{% set video_count = namespace(value=0) %}"
+            "{% for message in messages %}"
+            "{% if loop.first and message.role != 'system' %}"
+            "<|pangu_text_start|><|message_start|>\u7cfb\u7edf\uff1a<|message_end|>"
+            "{% endif %}"
+            "<|message_start|>{{ role_name(message.role) }}\uff1a"
+            "{% if message.content is string %}"
+            "{{ message.content }}<|message_end|>"
+            "{% else %}"
+            "{% for content in message.content %}"
+            "{% set ctype = content.type|default('') %}"
+            "{% set is_img = (ctype == 'image') or ('image' in content) or ('image_url' in content) %}"
+            "{% set is_vid = (ctype == 'video') or ('video' in content) %}"
+            "{% if is_img %}"
+            "{% set image_count.value = image_count.value + 1 %}"
+            "{% if add_vision_id %}\u56fe\u7247 {{ image_count.value }}: {% endif %}"
+            "<|vision_start|><|image_pad|><|vision_end|>"
+            "{% elif is_vid %}"
+            "{% set video_count.value = video_count.value + 1 %}"
+            "{% if add_vision_id %}\u89c6\u9891 {{ video_count.value }}: {% endif %}"
+            "<|vision_start|><|video_pad|><|vision_end|>"
+            "{% elif content.text is defined %}"
+            "{{ content.text }}"
+            "{% endif %}"
+            "{% endfor %}<|message_end|>"
+            "{% endif %}"
+            "{% endfor %}"
+            "{% if add_generation_prompt %}<|message_start|>\u52a9\u624b\uff1a{% endif %}"
+        )
+
+    def _append_ids(
+        self,
+        input_ids: List[int],
+        attention_mask: List[int],
+        labels: List[int],
+        ids: List[int],
+        train: bool,
+    ) -> None:
+        input_ids += ids
+        attention_mask += [1] * len(ids)
+        labels += ids if train else [IGNORE_INDEX] * len(ids)
+
+    def _eos_ids(self) -> List[int]:
+        eos_token_id = getattr(self.tokenizer, "eos_token_id", None)
+        if isinstance(eos_token_id, list):
+            return eos_token_id
+        if eos_token_id is not None:
+            return [eos_token_id]
+        eos_token = getattr(self.tokenizer, "eos_token", None)
+        if eos_token is None:
+            return []
+        return self.tokenizer.encode(eos_token, add_special_tokens=False)
+
+    def encode_pretrain_text(self, text: str, max_seq_len: int = 8192) -> List[Dict[str, List[int]]]:
+        input_ids = self.tokenizer.encode(text.strip(), add_special_tokens=False) + self._eos_ids()
+        examples = []
+        for start in range(0, len(input_ids), max_seq_len):
+            chunk = input_ids[start : start + max_seq_len]
+            examples.append(
+                {
+                    "input_ids": chunk,
+                    "attention_mask": [1] * len(chunk),
+                    "labels": chunk.copy(),
+                }
+            )
+        return examples
+
+    def encode_interleaved_messages(
+        self,
+        conversations: Sequence[Dict[str, str]],
+        num_tokens: Dict[str, List[int]] = None,
+        max_seq_len: int = 8192,
+        **kwargs,
+    ) -> Dict[str, List[int]]:
+        del max_seq_len, kwargs
+        if num_tokens is None:
+            num_tokens = defaultdict(list)
+        image_token_num_list = iter(num_tokens.get("image", []))
+        content = ""
+        for message in conversations[0]["values"]:
+            if message[0] == "text":
+                content += message[1]
+            elif message[0] == "image":
+                content += self.image_pattern(next(image_token_num_list))
+            else:
+                raise ValueError(f"Unknown value type: {message[0]}")
+
+        input_ids = self.tokenizer.encode(content.strip(), add_special_tokens=False) + self._eos_ids()
+        labels = input_ids.copy()
+        tokenized_example = {
+            "input_ids": torch.tensor(input_ids),
+            "attention_mask": torch.tensor([1] * len(input_ids)),
+            "labels": torch.tensor(labels),
+        }
+        image_mask = tokenized_example["input_ids"] == self.image_token_id
+        tokenized_example["input_ids"][image_mask] = TYPE2INDEX["input"]["image"]
+        tokenized_example["labels"][image_mask] = IGNORE_INDEX
+        return tokenized_example
+
+    def encode_messages(
+        self,
+        conversations: Sequence[Dict[str, str]],
+        num_tokens: Dict[str, List[int]] = None,
+        **kwargs,
+    ) -> Dict[str, List[int]]:
+        del kwargs
+        if num_tokens is None:
+            num_tokens = defaultdict(list)
+
+        input_ids, attention_mask, labels = [], [], []
+        image_token_num_list = iter(num_tokens.get("image", []))
+        video_token_num_list = iter(num_tokens.get("video", []))
+
+        if not conversations or conversations[0][0] != "system":
+            default_system = (
+                f"{self.text_start_token}{self.message_start_token}{self._role_name('system')}"
+                f"\uff1a{self.message_end_token}"
+            )
+            default_system_ids = self.tokenizer.encode(default_system, add_special_tokens=False)
+            self._append_ids(input_ids, attention_mask, labels, default_system_ids, train=False)
+
+        for message in conversations:
+            role = message[0]
+            content = ""
+            for value in message[1:]:
+                if value[0] == "text":
+                    content += value[1]
+                elif value[0] == "image":
+                    content += self.image_pattern(next(image_token_num_list))
+                elif value[0] == "video":
+                    content += self.video_pattern(next(video_token_num_list))
+                else:
+                    raise ValueError(f"Unknown value type: {value[0]}")
+
+            prefix = f"{self.message_start_token}{self._role_name(role)}\uff1a"
+            suffix = self.message_end_token
+            prefix_ids = self.tokenizer.encode(prefix, add_special_tokens=False)
+            content_ids = self.tokenizer.encode(content, add_special_tokens=False)
+            suffix_ids = self.tokenizer.encode(suffix, add_special_tokens=False)
+            train = role == "assistant"
+
+            self._append_ids(input_ids, attention_mask, labels, prefix_ids, train=False)
+            self._append_ids(input_ids, attention_mask, labels, content_ids + suffix_ids, train=train)
+
+        tokenized_example = {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
+        tokenized_example = {k: torch.tensor(v) for k, v in tokenized_example.items()}
+
+        image_mask = tokenized_example["input_ids"] == self.image_token_id
+        input_mask = tokenized_example["labels"] == IGNORE_INDEX
+        input_image_mask = image_mask & input_mask
+        output_image_mask = image_mask & ~input_mask
+        tokenized_example["input_ids"][input_image_mask] = TYPE2INDEX["input"]["image"]
+        tokenized_example["input_ids"][output_image_mask] = TYPE2INDEX["output"]["image"]
+        tokenized_example["labels"][image_mask] = IGNORE_INDEX
+
+        video_mask = tokenized_example["input_ids"] == self.video_token_id
+        tokenized_example["input_ids"][video_mask] = TYPE2INDEX["input"]["video"]
+        tokenized_example["labels"][video_mask] = IGNORE_INDEX
+
+        return tokenized_example
+
+
 TEMPLATES = {
     "qwen2vl": Qwen2VLChatTemplate,
     "qwen3vl": Qwen3VLChatTemplate,
@@ -1122,6 +1332,8 @@ TEMPLATES = {
     "qwen3moe": Qwen3MoeChatTemplate,
     "seed_oss": SeedOssPretrainTemplate,
     "siglip_qwen3": SiglipQwen3ChatTemplate,
+    "openpangu_vl": OpenPanguVLChatTemplate,
+    "pangu_vl": OpenPanguVLChatTemplate,
 }
 
 

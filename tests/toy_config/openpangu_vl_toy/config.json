@@ -1,0 +1,73 @@
+{
+  "architectures": [
+    "OpenPanguVL"
+  ],
+  "attention_bias": false,
+  "attention_dropout": 0.0,
+  "bos_token_id": 1,
+  "eos_token_id": 2,
+  "pad_token_id": 0,
+  "first_k_dense_replace": 1,
+  "head_dim": 8,
+  "hidden_act": "silu",
+  "hidden_size": 32,
+  "image_token_id": 5,
+  "intermediate_size": 64,
+  "max_position_embeddings": 128,
+  "mhc_num_stream": 4,
+  "mhc_recur_norm": 2,
+  "mhc_use_gamma": true,
+  "model_type": "openpangu_vl",
+  "moe_intermediate_size": 8,
+  "n_routed_experts": 4,
+  "n_shared_experts": 1,
+  "norm_topk_prob": true,
+  "num_attention_heads": 4,
+  "num_experts_per_tok": 2,
+  "num_hidden_layers": 2,
+  "num_key_value_heads": 2,
+  "partial_rotary_factor": 1.0,
+  "rms_norm_eps": 1e-05,
+  "rope_scaling": {
+    "mrope_interleaved": false,
+    "mrope_section": [
+      1,
+      1,
+      2
+    ],
+    "rope_type": "default",
+    "type": "default"
+  },
+  "rope_theta": 10000,
+  "routed_scaling_factor": 2.5,
+  "swa_layers": [],
+  "tie_word_embeddings": false,
+  "topk_group": 1,
+  "use_cache": true,
+  "use_mhc": false,
+  "video_token_id": 6,
+  "vision_config": {
+    "depth": 1,
+    "fullatt_block_indexes": [
+      0
+    ],
+    "hidden_act": "gelu",
+    "hidden_size": 16,
+    "in_channels": 3,
+    "initializer_range": 0.02,
+    "intermediate_size": 32,
+    "mm_unit_vision_select_layer": [
+      -1
+    ],
+    "num_heads": 4,
+    "out_hidden_size": 32,
+    "patch_size": 2,
+    "spatial_merge_size": 2,
+    "temporal_patch_size": 1,
+    "use_gatedmerger": false,
+    "window_size": 4
+  },
+  "vision_end_token_id": 4,
+  "vision_start_token_id": 3,
+  "vocab_size": 64
+}

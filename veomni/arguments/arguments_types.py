@@ -549,6 +549,24 @@ class TrainingArguments:
             "help": "Log paper-style training-batch MoE MaxVio every N steps. 0 = disabled. Requires wandb.enable=True."
         },
     )
+    moe_load_balance_strategy: Literal["auto", "none", "aux_loss", "aux_free"] = field(
+        default="auto",
+        metadata={
+            "help": (
+                "MoE load-balancing strategy. 'auto' preserves model defaults, 'none' disables trainer-added "
+                "MoE balancing, 'aux_loss' uses differentiable router aux loss, 'aux_free' uses per-step "
+                "expert-bias updates."
+            )
+        },
+    )
+    moe_aux_free_load_balance: bool = field(
+        default=False,
+        metadata={"help": "Deprecated compatibility switch. Prefer train.moe_load_balance_strategy='aux_free'."},
+    )
+    moe_aux_free_load_balance_update_rate: float = field(
+        default=1.0e-3,
+        metadata={"help": "Per-step update rate for auxiliary-loss-free MoE expert bias updates."},
+    )
 
     # sub-argument groups
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
@@ -565,6 +583,7 @@ class TrainingArguments:
         self.world_size = int(os.getenv("WORLD_SIZE", 1))
 
         self._validate_accelerator()
+        self._validate_moe_load_balance()
         self._derive_batch_config()
         self._resolve_checkpoint_paths()
         self._resolve_profile()
@@ -625,6 +644,28 @@ class TrainingArguments:
                     "used with train.accelerator.fsdp_config.fsdp_mode='fsdp2'. "
                     f"Received fsdp_mode={acc.fsdp_config.fsdp_mode!r}. Disable this flag or switch to fsdp2.",
                 )
+
+    def _validate_moe_load_balance(self):
+        valid_strategies = {"auto", "none", "aux_loss", "aux_free"}
+        if self.moe_load_balance_strategy not in valid_strategies:
+            raise ValueError(
+                "`moe_load_balance_strategy` must be one of "
+                f"{sorted(valid_strategies)}, got {self.moe_load_balance_strategy!r}."
+            )
+        if self.moe_load_balance_monitor_interval < 0:
+            raise ValueError("`moe_load_balance_monitor_interval` must be non-negative.")
+        if self.moe_aux_free_load_balance:
+            if self.moe_load_balance_strategy in {"none", "aux_loss"}:
+                raise ValueError(
+                    "`moe_aux_free_load_balance=True` conflicts with "
+                    f"`moe_load_balance_strategy={self.moe_load_balance_strategy!r}`."
+                )
+            if self.moe_load_balance_strategy == "auto":
+                self.moe_load_balance_strategy = "aux_free"
+        if self.moe_load_balance_strategy == "aux_free" and self.moe_aux_free_load_balance_update_rate <= 0:
+            raise ValueError(
+                "`moe_aux_free_load_balance_update_rate` must be positive when aux-free balance is enabled."
+            )
 
     def _derive_batch_config(self):
         acc = self.accelerator
@@ -1171,7 +1212,19 @@ class DataArguments:
                 self.text_keys = "messages"
             elif self.data_type == "mixed_text":
                 pass
-            elif self.data_type == "qwen3_siglip_vlm":
+            elif self.data_type in {
+                "qwen2_vl",
+                "qwen2_5_vl",
+                "qwen3_vl",
+                "qwen3_vl_moe",
+                "qwen3_5",
+                "qwen3_5_moe",
+                "qwen3_siglip_vlm",
+                "qwen2_5_omni",
+                "qwen3_omni_moe",
+                "openpangu_vl",
+                "pangu_vl",
+            }:
                 pass
             elif self.data_type == "classification":
                 self.text_keys = "text"

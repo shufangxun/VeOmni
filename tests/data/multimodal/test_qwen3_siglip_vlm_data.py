@@ -85,18 +85,19 @@ def _build_transform_kwargs():
 
 
 def test_plaintext_source_does_not_require_image_fields():
-    sample = {"text": "plain language sample", "domain": "pt"}
+    sample = {"text": "plain language sample", "domain": "raw_web"}
     output = process_sample_qwen3_siglip_vlm(
         sample,
         preprocess="plaintext",
         text_keys="text",
         image_keys=None,
+        domain="text_web",
         **_build_transform_kwargs(),
     )[0]
 
     assert "pixel_values" not in output
     assert output["image_mask"].sum().item() == 0
-    assert output["domain_name"] == "pt"
+    assert output["domain_name"] == "text_web"
 
 
 def test_conversation_sharegpt_format_masks_user_turn_and_keeps_assistant_loss():
@@ -126,13 +127,14 @@ def test_conversation_sharegpt_text_only_requires_no_images():
             {"from": "human", "value": "Who wrote The Hobbit?"},
             {"from": "gpt", "value": "J. R. R. Tolkien wrote The Hobbit."},
         ],
-        "domain": "text_sft",
+        "domain": "raw_sft",
     }
     output = process_sample_qwen3_siglip_vlm(
         sample,
         preprocess="conversation",
         text_keys="conversations",
         image_keys=None,
+        domain="text_sft",
         **_build_transform_kwargs(),
     )[0]
 
@@ -146,13 +148,14 @@ def test_interleaved_aligned_lists_use_image_tokens_and_text_lm_labels():
     sample = {
         "images": [{"bytes": _image_bytes(), "path": None}, None],
         "texts": [None, "a small image"],
-        "domain": "caption",
+        "domain": "raw_caption",
     }
     output = process_sample_qwen3_siglip_vlm(
         sample,
         preprocess="interleaved",
         text_keys="texts",
         image_keys="images",
+        domain="caption",
         **_build_transform_kwargs(),
     )[0]
 

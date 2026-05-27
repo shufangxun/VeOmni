@@ -44,6 +44,7 @@ from ..utils.multisource_utils import parse_multisource_config
 logger = logging.get_logger(__name__)
 
 DATASET_REGISTRY = Registry("Dataset")
+DYNAMIC_BATCH_OVERLONG_SKIP_STATS_KEY = "_dynamic_batch_overlong_skip_stats"
 
 
 def build_dataset(dataset_name: str, **kwargs) -> "Dataset":
@@ -833,6 +834,8 @@ class DynamicBatchingSizeDataset(IterableDataset):
         self._buffer = []
         self._buffer_of_output_index = []
         self._buffer_token_count = 0
+        self._overlong_skip_stats = self._new_overlong_skip_stats()
+        self._pending_overlong_skip_stats = self._new_overlong_skip_stats()
 
         self._just_resumed = False  # Flag to indicate if the dataset has just been resumed from a checkpoint, used to skip buffer checks on the first iteration after resume.
 
@@ -849,6 +852,64 @@ class DynamicBatchingSizeDataset(IterableDataset):
         self._save_by_idx = value
         if hasattr(self.dataset, "output_index_for_resume"):
             self.dataset.output_index_for_resume = value
+
+    @staticmethod
+    def _new_overlong_skip_stats() -> Dict[str, int]:
+        return {
+            "seen_samples": 0,
+            "skipped_samples": 0,
+            "skipped_tokens": 0,
+            "max_skipped_length": 0,
+        }
+
+    @property
+    def overlong_skip_stats(self) -> Dict[str, int]:
+        return copy.deepcopy(self._overlong_skip_stats)
+
+    @staticmethod
+    def _to_int_length(length: Any) -> int:
+        if torch.is_tensor(length):
+            return int(length.item())
+        return int(length)
+
+    @staticmethod
+    def _should_log_overlong_skip(skipped_samples: int) -> bool:
+        return skipped_samples <= 10 or skipped_samples % 100 == 0
+
+    def _record_seen_sample(self) -> None:
+        self._overlong_skip_stats["seen_samples"] += 1
+        self._pending_overlong_skip_stats["seen_samples"] += 1
+
+    def _record_overlong_skip(self, length: int) -> None:
+        stats = self._overlong_skip_stats
+        stats["skipped_samples"] += 1
+        stats["skipped_tokens"] += length
+        stats["max_skipped_length"] = max(stats["max_skipped_length"], length)
+
+        pending_stats = self._pending_overlong_skip_stats
+        pending_stats["skipped_samples"] += 1
+        pending_stats["skipped_tokens"] += length
+        pending_stats["max_skipped_length"] = max(pending_stats["max_skipped_length"], length)
+
+        if not self._should_log_overlong_skip(stats["skipped_samples"]):
+            return
+
+        skip_ratio = stats["skipped_samples"] / max(stats["seen_samples"], 1)
+        worker_info = get_worker_info()
+        worker_suffix = "" if worker_info is None else f", worker_id={worker_info.id}"
+        logger.warning(
+            "Dynamic batching skipped overlong sample: "
+            f"length={length} > micro_batch_seq_length={self.micro_batch_seq_length}{worker_suffix}; "
+            f"skipped={stats['skipped_samples']}/{stats['seen_samples']} ({skip_ratio:.4%}), "
+            f"skipped_tokens={stats['skipped_tokens']}, max_skipped_length={stats['max_skipped_length']}. "
+            "Increase max_seq_len or lower upstream text/image budgets if too many samples are skipped."
+        )
+
+    def _attach_overlong_skip_stats(self, micro_batch: Any) -> Any:
+        if isinstance(micro_batch, dict):
+            micro_batch[DYNAMIC_BATCH_OVERLONG_SKIP_STATS_KEY] = copy.deepcopy(self._pending_overlong_skip_stats)
+            self._pending_overlong_skip_stats = self._new_overlong_skip_stats()
+        return micro_batch
 
     def __iter__(self):
         """Iterate over the dataset and yield dynamically batched micro batches.
@@ -884,6 +945,7 @@ class DynamicBatchingSizeDataset(IterableDataset):
                     micro_batch = self._get_micro_batch()
                     micro_batch = self.dynamic_batching_collate_fn(micro_batch)
                     if micro_batch is not None:
+                        micro_batch = self._attach_overlong_skip_stats(micro_batch)
                         yield micro_batch
                     else:
                         logger.warning("dynamic_batching_collate_fn returned None, skip this micro_batch")
@@ -897,11 +959,10 @@ class DynamicBatchingSizeDataset(IterableDataset):
                 samples_to_add = item if isinstance(item, list) else [item]
                 for sample_idx, sample in enumerate(samples_to_add):
                     length = self.get_length_fn(sample)
-                    if length > self.micro_batch_seq_length and not self.force_generate_long_sequence:
-                        # TODO: record the count of discarded long examples for monitoring
-                        logger.warning(
-                            f"Sample length {length} exceeds micro batch seq length {self.micro_batch_seq_length}, skipping. If you want to force generate a micro batch with this sample, enable force_generate_long_sequence."
-                        )
+                    length_value = self._to_int_length(length)
+                    self._record_seen_sample()
+                    if length_value > self.micro_batch_seq_length and not self.force_generate_long_sequence:
+                        self._record_overlong_skip(length_value)
                         continue
 
                     self._buffer.append((sample, length))
@@ -919,6 +980,7 @@ class DynamicBatchingSizeDataset(IterableDataset):
                         micro_batch = self._get_micro_batch()
                         micro_batch = self.dynamic_batching_collate_fn(micro_batch)
                         if micro_batch is not None:
+                            micro_batch = self._attach_overlong_skip_stats(micro_batch)
                             yield micro_batch
                         else:
                             logger.warning("dynamic_batching_collate_fn returned None, skip this micro_batch")
@@ -988,6 +1050,8 @@ class DynamicBatchingSizeDataset(IterableDataset):
             dict: State dictionary containing:
                 - save_by_idx: Whether indices are saved instead of samples.
                 - buffer_token_count: Total token count in the buffer.
+                - overlong_skip_stats: Cumulative overlong-sample skip counters.
+                - pending_overlong_skip_stats: Overlong-sample counters not emitted to a batch yet.
                 - buffer: Buffered samples or their indices.
                 - dynamic_batch_upstream_dataset_state: Upstream dataset state (if available).
         """
@@ -995,6 +1059,8 @@ class DynamicBatchingSizeDataset(IterableDataset):
             "save_by_idx": self.save_by_idx,
             # Make sure we store an integer instead of any tensor
             "buffer_token_count": int(self._buffer_token_count),
+            "overlong_skip_stats": copy.deepcopy(self._overlong_skip_stats),
+            "pending_overlong_skip_stats": copy.deepcopy(self._pending_overlong_skip_stats),
         }
 
         # the state_dict might be called frequently with StatefulDataloaders(see more details of snapshot_every_n_steps)
@@ -1022,6 +1088,8 @@ class DynamicBatchingSizeDataset(IterableDataset):
                 - save_by_idx: Whether the saved buffer contains indices.
                 - buffer: Saved buffer (samples or indices).
                 - buffer_token_count: Saved token count.
+                - overlong_skip_stats: Cumulative overlong-sample skip counters (optional).
+                - pending_overlong_skip_stats: Overlong-sample counters not emitted to a batch yet (optional).
                 - dynamic_batch_upstream_dataset_state: Upstream dataset state (optional).
 
         Raises:
@@ -1033,6 +1101,12 @@ class DynamicBatchingSizeDataset(IterableDataset):
         """
         # prev_save_by_idx does not have to be equal to self.save_by_idx, however, we still need to resume the buffer according to it.
         prev_save_by_idx = state_dict["save_by_idx"]
+        self._overlong_skip_stats = copy.deepcopy(
+            state_dict.get("overlong_skip_stats", self._new_overlong_skip_stats())
+        )
+        self._pending_overlong_skip_stats = copy.deepcopy(
+            state_dict.get("pending_overlong_skip_stats", self._new_overlong_skip_stats())
+        )
         if prev_save_by_idx:
             self._buffer = []
             self._buffer_of_output_index = []

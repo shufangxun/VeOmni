@@ -71,7 +71,15 @@ def build_unified_diff(
         tofile=f"b/{target_file}",
         n=context_lines,
     )
-    return "".join(diff)
+    lines = []
+    for line in "".join(diff).splitlines():
+        if line and line[0] in " +-" and not line[1:].strip():
+            lines.append(line[0] if line[0] in "+-" else "")
+        else:
+            lines.append(line)
+    while lines and not lines[-1].strip():
+        lines.pop()
+    return "\n".join(lines) + ("\n" if lines else "")
 
 
 def default_diff_path(output_dir: Path, target_file: str) -> Path:

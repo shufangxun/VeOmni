@@ -24,11 +24,12 @@ def test_mixed_text_plaintext_uses_pretrain_branch_and_chunks():
     template = MixedChatmlTemplate(DummyTokenizer())
 
     examples = process_mixed_text_example(
-        {"text": "abcdef", "domain": "pt"},
+        {"text": "abcdef", "domain": "raw_pt"},
         chat_template=template,
         max_seq_len=4,
         preprocess="plaintext",
         text_keys="text",
+        domain="pt",
     )
 
     assert len(examples) == 2

@@ -30,6 +30,7 @@ import ast
 import importlib
 import inspect
 import re
+import sys
 import textwrap
 from pathlib import Path
 from typing import Any, Optional
@@ -490,8 +491,65 @@ class ModelingCodeGenerator:
         - Adding custom post-import code blocks
         - Adding additional imports from the patch config
         """
-        output_lines = []
+        import_lines = []
         drop_imported_names = self.config.drop_imported_names
+
+        def _module_name(import_line: str) -> str:
+            if import_line.startswith("from "):
+                return import_line.split()[1]
+            if import_line.startswith("import "):
+                return import_line.split()[1].split(",", 1)[0]
+            return import_line
+
+        def _format_import_from(module: str, names: list[ast.alias]) -> str:
+            names_str = ", ".join(
+                alias.name if alias.asname is None else f"{alias.name} as {alias.asname}" for alias in names
+            )
+            line = f"from {module} import {names_str}"
+            if len(line) <= 119 or len(names) <= 1:
+                return line
+
+            formatted_names = [
+                alias.name if alias.asname is None else f"{alias.name} as {alias.asname}" for alias in names
+            ]
+            body = "\n".join(f"    {name}," for name in formatted_names)
+            return f"from {module} import (\n{body}\n)"
+
+        def _import_node_to_source(node: ast.stmt) -> str:
+            if isinstance(node, ast.ImportFrom) and node.module is not None and node.level == 0:
+                return _format_import_from(node.module, node.names)
+            return ast_to_source(node)
+
+        def _sort_import_lines(lines: list[str]) -> list[str]:
+            if not lines:
+                return []
+
+            first_party_prefixes = ("veomni", "tests", "tasks")
+
+            def import_key(line: str) -> tuple[int, int, str, str]:
+                module = _module_name(line)
+                root = module.split(".", 1)[0]
+                if module == "__future__":
+                    group = 0
+                elif root in sys.stdlib_module_names:
+                    group = 1
+                elif root in first_party_prefixes:
+                    group = 3
+                else:
+                    group = 2
+                import_type = 0 if line.startswith("import ") else 1
+                return group, import_type, module, line
+
+            sorted_lines = sorted(lines, key=import_key)
+            grouped_lines = []
+            previous_group = None
+            for line in sorted_lines:
+                group = import_key(line)[0]
+                if previous_group is not None and group != previous_group:
+                    grouped_lines.append("")
+                grouped_lines.append(line)
+                previous_group = group
+            return grouped_lines
 
         def _should_keep_alias(alias: ast.alias) -> bool:
             if not drop_imported_names:
@@ -521,39 +579,40 @@ class ModelingCodeGenerator:
                         if filtered_node.module:
                             absolute_module = f"{absolute_module}.{filtered_node.module}"
                         new_node = ast.ImportFrom(module=absolute_module, names=filtered_node.names, level=0)
-                        output_lines.append(ast_to_source(new_node))
+                        import_lines.append(_import_node_to_source(new_node))
                     else:
-                        output_lines.append(ast_to_source(filtered_node))
+                        import_lines.append(_import_node_to_source(filtered_node))
                 else:
-                    output_lines.append(ast_to_source(filtered_node))
+                    import_lines.append(_import_node_to_source(filtered_node))
             else:
                 filtered_names = [alias for alias in node.names if _should_keep_alias(alias)]
                 if not filtered_names:
                     continue
                 filtered_node = ast.Import(names=filtered_names)
-                output_lines.append(ast_to_source(filtered_node))
+                import_lines.append(_import_node_to_source(filtered_node))
 
         # Add additional imports from config first — keep these before the
         # post-import blocks (and before helpers) so helper bodies can rely
         # on any names declared via ``add_import``.
         if self.config.additional_imports:
-            output_lines.append("")
-            output_lines.append("# Additional imports for patches")
             for imp in self.config.additional_imports:
                 if imp.is_from_import:
                     if imp.names:
-                        names_str = ", ".join(imp.names)
-                        output_lines.append(f"from {imp.module} import {names_str}")
+                        aliases = [ast.alias(name=name, asname=None) for name in imp.names]
+                        import_lines.append(_format_import_from(imp.module, aliases))
                     else:
-                        output_lines.append(f"from {imp.module} import *")
+                        import_lines.append(f"from {imp.module} import *")
                 else:
                     if imp.alias:
-                        output_lines.append(f"import {imp.module} as {imp.alias}")
+                        import_lines.append(f"import {imp.module} as {imp.alias}")
                     else:
-                        output_lines.append(f"import {imp.module}")
+                        import_lines.append(f"import {imp.module}")
+
+        output_lines = _sort_import_lines(import_lines)
 
         # Add custom post-import blocks from config
         if self.config.post_import_blocks:
+            output_lines.append("")
             output_lines.append("")
             output_lines.append("# Additional import blocks for patches")
             for block in self.config.post_import_blocks:
@@ -586,6 +645,7 @@ class ModelingCodeGenerator:
             src = self._render_helper_source(helper)
             if not src:
                 continue
+            lines.append("")
             lines.append("")
             lines.append(src)
         return "\n".join(lines)
@@ -1113,6 +1173,8 @@ class ModelingCodeGenerator:
         # 4. Join and format output
         output = "\n".join(output_parts)
         output = _collapse_blank_lines(output, max_consecutive=2)
+        if output and not output.endswith("\n"):
+            output += "\n"
 
         # 5. Write to file if path provided
         if output_path:

@@ -81,6 +81,7 @@ if TYPE_CHECKING:
 logger = logging.get_logger(__name__)
 
 CACHE_DIR = os.path.expanduser(os.getenv("CACHE_DIR", os.path.join("~/.cache", "veomni")))
+DYNAMIC_BATCH_OVERLONG_SKIP_STATS_KEY = "_dynamic_batch_overlong_skip_stats"
 
 
 def _compute_seqlens(micro_batch: Dict[str, "torch.Tensor"]) -> List[int]:
@@ -184,6 +185,9 @@ class EnvironMeter:
         self.batch_seqlens = []
         self.batch_ds_idx = []
         self.images_seqlens = []
+        self.overlong_skip_stats = self._new_overlong_skip_stats()
+        self.step_overlong_skip_stats = self._new_overlong_skip_stats()
+        self.has_overlong_skip_stats = False
 
         if self.enable_multisource:
             if dataloader is None or data_path is None:
@@ -203,7 +207,12 @@ class EnvironMeter:
             gc.disable()
 
     def state_dict(self) -> Dict[str, Any]:
-        state_dict = {"consume_tokens": self.consume_tokens, "consume_chunks": self.consume_chunks}
+        state_dict = {
+            "consume_tokens": self.consume_tokens,
+            "consume_chunks": self.consume_chunks,
+            "overlong_skip_stats": dict(self.overlong_skip_stats),
+            "has_overlong_skip_stats": self.has_overlong_skip_stats,
+        }
         if self.enable_multisource:
             state_dict.update({"multisource_tracker": self.multisource_tracker.state_dict()})
 
@@ -212,18 +221,94 @@ class EnvironMeter:
     def load_state_dict(self, state_dict: Dict[str, Any]):
         self.consume_tokens = state_dict["consume_tokens"]
         self.consume_chunks = state_dict["consume_chunks"]
+        self.overlong_skip_stats = dict(state_dict.get("overlong_skip_stats", self._new_overlong_skip_stats()))
+        self.has_overlong_skip_stats = state_dict.get("has_overlong_skip_stats", False)
         if self.enable_multisource:
             self.multisource_tracker.load_state_dict(state_dict["multisource_tracker"])
+
+    @staticmethod
+    def _new_overlong_skip_stats() -> Dict[str, int]:
+        return {
+            "seen_samples": 0,
+            "skipped_samples": 0,
+            "skipped_tokens": 0,
+            "max_skipped_length": 0,
+        }
+
+    def _consume_overlong_skip_stats(self, micro_batch: Dict[str, "torch.Tensor"]) -> None:
+        stats = micro_batch.pop(DYNAMIC_BATCH_OVERLONG_SKIP_STATS_KEY, None)
+        if not stats:
+            return
+
+        self.has_overlong_skip_stats = True
+        self.step_overlong_skip_stats["seen_samples"] += int(stats.get("seen_samples", 0))
+        self.step_overlong_skip_stats["skipped_samples"] += int(stats.get("skipped_samples", 0))
+        self.step_overlong_skip_stats["skipped_tokens"] += int(stats.get("skipped_tokens", 0))
+        self.step_overlong_skip_stats["max_skipped_length"] = max(
+            self.step_overlong_skip_stats["max_skipped_length"],
+            int(stats.get("max_skipped_length", 0)),
+        )
+
+    def _build_overlong_skip_metrics(self) -> Dict[str, Any]:
+        if not self.has_overlong_skip_stats:
+            return {}
+
+        step_seen, step_skipped, step_skipped_tokens = all_reduce(
+            (
+                self.step_overlong_skip_stats["seen_samples"],
+                self.step_overlong_skip_stats["skipped_samples"],
+                self.step_overlong_skip_stats["skipped_tokens"],
+            ),
+            op="sum",
+            group=get_parallel_state().dp_group,
+        )
+        step_max_skipped_length = all_reduce(
+            self.step_overlong_skip_stats["max_skipped_length"],
+            op="max",
+            group=get_parallel_state().dp_group,
+        )
+
+        step_seen = int(step_seen)
+        step_skipped = int(step_skipped)
+        step_skipped_tokens = int(step_skipped_tokens)
+        step_max_skipped_length = int(step_max_skipped_length)
+
+        self.overlong_skip_stats["seen_samples"] += step_seen
+        self.overlong_skip_stats["skipped_samples"] += step_skipped
+        self.overlong_skip_stats["skipped_tokens"] += step_skipped_tokens
+        self.overlong_skip_stats["max_skipped_length"] = max(
+            self.overlong_skip_stats["max_skipped_length"],
+            step_max_skipped_length,
+        )
+
+        cumulative_seen = self.overlong_skip_stats["seen_samples"]
+        cumulative_skipped = self.overlong_skip_stats["skipped_samples"]
+        metrics = {
+            "data/overlong_seen_samples": step_seen,
+            "data/overlong_skipped_samples": step_skipped,
+            "data/overlong_skip_ratio": step_skipped / step_seen if step_seen else 0.0,
+            "data/overlong_skipped_tokens": step_skipped_tokens,
+            "data/overlong_max_skipped_length": step_max_skipped_length,
+            "data/overlong_cumulative_seen_samples": cumulative_seen,
+            "data/overlong_cumulative_skipped_samples": cumulative_skipped,
+            "data/overlong_cumulative_skip_ratio": cumulative_skipped / cumulative_seen if cumulative_seen else 0.0,
+            "data/overlong_cumulative_skipped_tokens": self.overlong_skip_stats["skipped_tokens"],
+            "data/overlong_cumulative_max_skipped_length": self.overlong_skip_stats["max_skipped_length"],
+        }
+        self.step_overlong_skip_stats = self._new_overlong_skip_stats()
+        return metrics
 
     def add(self, micro_batch: Union[Dict[str, "torch.Tensor"], List[Dict[str, "torch.Tensor"]]]) -> None:
         if getattr(self.config, "condition_model_type", None) is None:  # hf model
             if isinstance(micro_batch, List):
                 for sample in micro_batch:
+                    self._consume_overlong_skip_stats(sample)
                     self.batch_seqlens.extend(_compute_seqlens(sample))
                     self.images_seqlens.extend(_compute_image_seqlens(sample))
                     if self.enable_multisource:
                         self.batch_ds_idx.extend(_get_multisource_ds_idx(sample))
             else:
+                self._consume_overlong_skip_stats(micro_batch)
                 self.batch_seqlens.extend(_compute_seqlens(micro_batch))
                 self.images_seqlens.extend(_compute_image_seqlens(micro_batch))
                 if self.enable_multisource:
@@ -303,6 +388,8 @@ class EnvironMeter:
 
         if self.enable_multisource:
             metrics.update(self.multisource_tracker.step(self.batch_ds_idx, self.batch_seqlens))
+
+        metrics.update(self._build_overlong_skip_metrics())
 
         if self.empty_cache_steps > 0 and global_step % self.empty_cache_steps == 0:
             empty_cache()

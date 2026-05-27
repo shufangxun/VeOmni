@@ -7,9 +7,9 @@ cd "${ROOT_DIR}"
 
 export PATH="${ROOT_DIR}/.venv/bin:${PATH}"
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
-export WANDB_API_KEY=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
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
-CONFIG="${CONFIG:-configs/multimodal/qwen3_moe_siglip/30a3b/stage2_full.yaml}"
+CONFIG="${CONFIG:-configs/multimodal/openpangu_vl/30a3b/sft.yaml}"
 
 if [[ "${WANDB_MODE:-}" != "disabled" && "${WANDB_DISABLED:-}" != "true" ]] \
   && grep -qE '^[[:space:]]+enable:[[:space:]]+true[[:space:]]*$' "${CONFIG}" \

@@ -38,13 +38,15 @@ class MoERouterMonitorCallback(Callback):
         self.monitor = None
         self._maxvio_batch_sum = 0.0
         self._maxvio_batch_count = 0
+        self._aux_free_no_bias_warned = False
 
         args: "VeOmniArguments" = self.trainer.args
-        if not args.train.wandb.enable:
-            logger.info_rank0("MoE router monitor disabled (wandb not enabled).")
-            return
-        if args.train.moe_load_balance_monitor_interval <= 0:
-            logger.info_rank0("MoE router monitor disabled (moe_load_balance_monitor_interval=0).")
+        self._wandb_monitor_enabled = args.train.wandb.enable and args.train.moe_load_balance_monitor_interval > 0
+        self._aux_free_enabled = args.train.moe_load_balance_strategy == "aux_free" or bool(
+            args.train.moe_aux_free_load_balance
+        )
+        if not self._wandb_monitor_enabled and not self._aux_free_enabled:
+            logger.info_rank0("MoE router monitor disabled.")
             return
 
         num_experts = self._get_num_experts(self.trainer.model_config)
@@ -56,12 +58,14 @@ class MoERouterMonitorCallback(Callback):
             set_active_monitor(self.monitor)
             logger.info_rank0(
                 f"MoE router monitor enabled: num_experts={num_experts}, "
-                f"interval={args.train.moe_load_balance_monitor_interval}, router_hooks={num_hooks}"
+                f"interval={args.train.moe_load_balance_monitor_interval}, router_hooks={num_hooks}, "
+                f"aux_free_balance={self._aux_free_enabled}"
             )
         else:
             logger.warning_rank0(
-                "moe_load_balance_monitor_interval > 0 but model config has no 'num_experts' or "
-                "'text_config.num_experts'. MoE router monitor not activated."
+                "MoE router monitor requested but model config has no expert-count field. "
+                "Expected one of num_experts, n_routed_experts, text_config.num_experts, "
+                "or text_config.n_routed_experts. MoE router monitor not activated."
             )
 
     @staticmethod
@@ -70,42 +74,81 @@ class MoERouterMonitorCallback(Callback):
             if candidate is None:
                 continue
             num_experts = getattr(candidate, "num_experts", None)
+            if num_experts is None:
+                num_experts = getattr(candidate, "n_routed_experts", None)
             if num_experts is not None:
                 return int(num_experts)
         return None
 
     @staticmethod
-    def _build_wandb_metrics(maxvio_batch_sum: float, maxvio_batch_count: int) -> dict[str, float]:
+    def _build_wandb_metrics(
+        maxvio_batch_sum: float,
+        maxvio_batch_count: int,
+        aux_free_metrics: dict[str, float] | None = None,
+    ) -> dict[str, float]:
+        metrics = dict(aux_free_metrics or {})
         if maxvio_batch_count <= 0:
-            return {}
-        return {"moe/maxvio_batch": maxvio_batch_sum / maxvio_batch_count}
+            return metrics
+        metrics["moe/maxvio_batch"] = maxvio_batch_sum / maxvio_batch_count
+        return metrics
 
     def on_step_end(self, state: TrainerState, **kwargs) -> None:
         args: "VeOmniArguments" = self.trainer.args
         if not self.monitor:
             return
 
-        load_matrix = self.monitor.get_load_matrix(current_step=state.global_step)
-        num_layers = load_matrix.shape[0]
-        if num_layers == 0:
-            if args.train.global_rank == 0 and state.global_step % args.train.moe_load_balance_monitor_interval == 0:
+        from ...utils.moe_monitor import MoERouterMonitor
+
+        counts, modules = self.monitor.drain_counts(current_step=state.global_step)
+        should_log = (
+            self._wandb_monitor_enabled and state.global_step % args.train.moe_load_balance_monitor_interval == 0
+        )
+        aux_free_metrics = {}
+        if self._aux_free_enabled:
+            aux_free_metrics = MoERouterMonitor.update_aux_free_bias(
+                counts,
+                modules,
+                update_rate=args.train.moe_aux_free_load_balance_update_rate,
+                return_metrics=should_log,
+            )
+            if counts.numel() > 0 and not aux_free_metrics and not self._aux_free_no_bias_warned:
+                logger.warning_rank0(
+                    "Auxiliary-loss-free MoE load balancing is enabled, but no recorded MoE module exposes "
+                    "'e_score_correction_bias'. No expert bias was updated."
+                )
+                self._aux_free_no_bias_warned = True
+
+        if counts.numel() == 0:
+            if args.train.global_rank == 0 and should_log:
                 logger.warning_rank0(
                     f"Step {state.global_step}: MoE router monitor has no recorded data. "
-                    "Check that router forward hooks are registered (e.g. PatchQwen3MoeTopKRouter)."
+                    "Check that router forward hooks or direct MoE block recording are active."
                 )
             return
 
-        from ...utils.moe_monitor import MoERouterMonitor
-
-        maxvio_batch = MoERouterMonitor.compute_maxvio_batch(load_matrix).item()
-        if not math.isnan(maxvio_batch):
-            self._maxvio_batch_sum += maxvio_batch
-            self._maxvio_batch_count += 1
-
-        if state.global_step % args.train.moe_load_balance_monitor_interval != 0:
+        if not self._wandb_monitor_enabled:
             return
 
-        metrics = self._build_wandb_metrics(self._maxvio_batch_sum, self._maxvio_batch_count)
+        load_matrix = MoERouterMonitor.counts_to_load_matrix(counts)
+        num_layers = load_matrix.shape[0]
+        if num_layers == 0:
+            if args.train.global_rank == 0 and should_log:
+                logger.warning_rank0(
+                    f"Step {state.global_step}: MoE router monitor has no recorded data. "
+                    "Check that router forward hooks or direct MoE block recording are active."
+                )
+            return
+
+        if self._wandb_monitor_enabled:
+            maxvio_batch = MoERouterMonitor.compute_maxvio_batch(load_matrix).item()
+            if not math.isnan(maxvio_batch):
+                self._maxvio_batch_sum += maxvio_batch
+                self._maxvio_batch_count += 1
+
+        if not should_log:
+            return
+
+        metrics = self._build_wandb_metrics(self._maxvio_batch_sum, self._maxvio_batch_count, aux_free_metrics)
         self._maxvio_batch_sum = 0.0
         self._maxvio_batch_count = 0
 
@@ -113,11 +156,16 @@ class MoERouterMonitorCallback(Callback):
             import wandb
 
             wandb.log(metrics, step=state.global_step)
-            logger.info_rank0(
-                f"Step {state.global_step}: logged MoE MaxVio_batch={metrics['moe/maxvio_batch']:.4f} "
-                f"averaged across {num_layers} layers and the last "
-                f"{args.train.moe_load_balance_monitor_interval} step(s)."
-            )
+            maxvio_msg = ""
+            if "moe/maxvio_batch" in metrics:
+                maxvio_msg = (
+                    f" MaxVio_batch={metrics['moe/maxvio_batch']:.4f} averaged across {num_layers} layers and the "
+                    f"last {args.train.moe_load_balance_monitor_interval} step(s)."
+                )
+            bias_msg = ""
+            if "moe/aux_free_bias_max_abs" in metrics:
+                bias_msg = f" aux_free_bias_max_abs={metrics['moe/aux_free_bias_max_abs']:.4f}."
+            logger.info_rank0(f"Step {state.global_step}: logged MoE metrics.{maxvio_msg}{bias_msg}")
 
     def on_train_end(self, state: TrainerState, **kwargs) -> None:
         if self.monitor is not None:
@@ -247,6 +295,8 @@ class TqdmCallback(Callback):
             short_name = name.split("/", 1)[-1]
             if short_name == "lr" or short_name.endswith("_weighted"):
                 return f"{short_name}: {value:.4g}"
+            if "loss" in short_name:
+                return f"{short_name}: {value:.4f}"
             return f"{short_name}: {value:.2f}"
 
         postfix = ", ".join(_format_metric(k, v) for k, v in self.trainer.step_train_metrics.items())

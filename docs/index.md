@@ -61,6 +61,7 @@ examples/qwen3.md
 examples/qwen3_5.md
 examples/qwen3_moe.md
 examples/qwen3_vl.md
+examples/openpangu_vl.md
 examples/qwen3_siglip_vlm.md
 examples/qwen3_moe_siglip_vlm.md
 examples/qwen3_omni_moe.md

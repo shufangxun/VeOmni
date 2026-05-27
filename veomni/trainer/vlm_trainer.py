@@ -40,6 +40,8 @@ from .base import BaseTrainer, _collect_muon_kwargs
 logger = helper.create_logger(__name__)
 MAX_PIXELS = 768 * 28 * 28
 SIGLIP_WRAPPER_MODEL_TYPES = ("qwen3_siglip_vlm", "qwen3_moe_siglip_vlm")
+OPENPANGU_VL_MODEL_TYPES = ("openpangu_vl",)
+SINGLE_LR_VLM_MODEL_TYPES = SIGLIP_WRAPPER_MODEL_TYPES + OPENPANGU_VL_MODEL_TYPES
 
 
 def _get_vlm_visual_module(model):
@@ -55,6 +57,13 @@ def _get_vlm_visual_module(model):
         return getattr(inner_model, "visual", None)
 
     return None
+
+
+def _get_openpangu_vl_connector_module(model):
+    visual = _get_vlm_visual_module(model)
+    if visual is None:
+        return None
+    return getattr(visual, "vision_projection", None)
 
 
 @dataclass
@@ -181,6 +190,14 @@ class VLMTrainer:
         if args.train.freeze_vit:
             if model_config.model_type in SIGLIP_WRAPPER_MODEL_TYPES:
                 self.base.model.vision_tower.requires_grad_(False)
+            elif model_config.model_type in OPENPANGU_VL_MODEL_TYPES:
+                visual = _get_vlm_visual_module(self.base.model)
+                if visual is None:
+                    raise AttributeError(f"Cannot find visual module for model_type={model_config.model_type}.")
+                visual.requires_grad_(False)
+                connector = _get_openpangu_vl_connector_module(self.base.model)
+                if connector is not None and not args.train.freeze_connector:
+                    connector.requires_grad_(True)
             elif model_config.model_type in ("qwen2_5_omni", "qwen3_omni_moe"):
                 self.base.model.thinker.visual.requires_grad_(False)
                 self.base.model.thinker.visual.merger.requires_grad_(True)
@@ -204,6 +221,14 @@ class VLMTrainer:
         if model_config.model_type in SIGLIP_WRAPPER_MODEL_TYPES:
             if args.train.freeze_connector:
                 self.base.model.connector.requires_grad_(False)
+            if args.train.freeze_llm:
+                self.base.model.language_model.requires_grad_(False)
+        elif model_config.model_type in OPENPANGU_VL_MODEL_TYPES:
+            if args.train.freeze_connector:
+                connector = _get_openpangu_vl_connector_module(self.base.model)
+                if connector is None:
+                    raise AttributeError(f"Cannot find connector module for model_type={model_config.model_type}.")
+                connector.requires_grad_(False)
             if args.train.freeze_llm:
                 self.base.model.language_model.requires_grad_(False)
 
@@ -261,7 +286,7 @@ class VLMTrainer:
     def _build_optimizer(self):
         args: VeOmniVLMArguments = self.base.args
 
-        if self.base.model_config.model_type in SIGLIP_WRAPPER_MODEL_TYPES:
+        if self.base.model_config.model_type in SINGLE_LR_VLM_MODEL_TYPES:
             trainable_params = [param for param in self.base.model.parameters() if param.requires_grad]
             param_groups = [{"params": trainable_params, "lr": args.train.optimizer.lr}] if trainable_params else []
         else:

@@ -1,23 +1,19 @@
 model:
-  config_path: /root/shufangxun/checkpoints/qwen3_moe_siglip_30a3b_init
-  model_path: /root/shufangxun/checkpoints/qwen3_moe_siglip_30a3b_init
-  tokenizer_path: /root/shufangxun/checkpoints/qwen3_moe_siglip_30a3b_init
-  model_config:
-    text_config:
-      output_router_logits: true
-      router_aux_loss_coef: 0.001
+  config_path: /root/shufangxun/Verl-Pangu30B/models/pangu30b_vl_clean
+  model_path: null
+  tokenizer_path: /root/shufangxun/Verl-Pangu30B/models/pangu30b_vl_clean
   ops_implementation:
     attn_implementation: flash_attention_2
     moe_implementation: fused_triton
-    load_balancing_loss_implementation: triton
+    cross_entropy_loss_implementation: liger_kernel
 
 data:
-  train_path: configs/multimodal/data/qwen3_siglip_stage1_connector.yaml
+  train_path: configs/multimodal/data/qwen3_siglip_stage2_full.yaml
   multisource_datasets_type: veomni_weighted_multisource
   datasets_type: iterable
-  data_type: qwen3_siglip_vlm
-  chat_template: siglip_qwen3
-  max_seq_len: 2048
+  data_type: openpangu_vl
+  chat_template: openpangu_vl
+  max_seq_len: 512
   train_size: 100000000
   dataloader:
     type: native
@@ -25,16 +21,19 @@ data:
     num_workers: 1
   dyn_bsz_buffer_size: 100
   mm_configs:
-    patch_size: 14
-    pixel_shuffle_factor: 2
     image_max_pixels: 200704
     image_min_pixels: 3136
     max_ratio: 200
+    video_max_pixels: 200704
+    video_total_pixels: 5898240
+    max_frames: 32
+    fps: 1.0
+    use_audio_in_video: false
 
 train:
   accelerator:
     ulysses_size: 1
-    ep_size: 4
+    ep_size: 2
     fsdp_config:
       fsdp_mode: fsdp2
       full_shard: true
@@ -45,32 +44,35 @@ train:
       enable_activation: false
   gradient_checkpointing:
     enable: true
-  global_batch_size: 16
+    enable_reentrant: false
+  global_batch_size: 4
   micro_batch_size: 1
   dyn_bsz_runtime: worker
   log_train_source_loss_steps: 5
   log_train_domain_loss_steps: 5
   moe_load_balance_monitor_interval: 1
+  moe_load_balance_strategy: aux_free
+  moe_aux_free_load_balance_update_rate: 0.001
   bsz_warmup_ratio: 0.01
   optimizer:
     type: adamw
-    lr: 1.0e-4
-    lr_warmup_ratio: 0.01
+    lr: 3.0e-4
+    lr_warmup_ratio: 0.0001
     lr_decay_style: cosine
     weight_decay: 0.01
     max_grad_norm: 1.0
-  freeze_vit: true
+  freeze_vit: false
   freeze_connector: false
-  freeze_llm: true
+  freeze_llm: false
   init_device: meta
   enable_full_determinism: false
   empty_cache_steps: 500
   checkpoint:
-    output_dir: exp/qwen3-moe-siglip-30a3b-stage1-connector
+    output_dir: exp/openpangu-vl-30a3b-sft
     manager: dcp
     save_steps: 0
     save_hf_weights: false
   wandb:
-    enable: true
-    project: qwen3-moe-siglip-vlm
-    name: Qwen3-MoE-SigLIP-30A3B-stage1-connector
+    enable: false
+    project: openpangu-vl-30a3b
+    name: openpangu-vl-30a3b-sft

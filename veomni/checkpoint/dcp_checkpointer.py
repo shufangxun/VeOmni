@@ -430,6 +430,12 @@ class DistributedCheckpointer(CheckpointerBase):
         if "model" not in state:
             raise ValueError("Model must be provided to save a distributed checkpoint.")
 
+        gc.collect()
+        empty_cache()
+        synchronize()
+        if dist.is_initialized():
+            dist.barrier()
+
         checkpoint_dir = f"{path}/{_GLOBAL_STEP_PREFIX}{global_steps}" if global_steps else path
         cls._create_checkpoint_dir(checkpoint_dir)
 
