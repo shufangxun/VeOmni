@@ -4,16 +4,64 @@ This guide summarizes the OpenPangu-VL adaptation in VeOmni, including data
 preparation, the stage-2 full-parameter training config, and checkpoint
 conversion for HuggingFace-style inference.
 
-The default training entrypoint is:
+## Environment
+
+Run all commands from the repository root:
 
 ```bash
-bash shells/multimodal/panguvl_moe/stage2_full.sh
+cd /root/shufangxun/VeOmni
 ```
 
-The shell uses:
+Install the GPU development environment once:
+
+```bash
+uv sync --extra gpu --extra audio --dev
+export PATH="${PWD}/.venv/bin:${PATH}"
+python --version
+```
+
+VeOmni targets Python 3.11 and transformers v5. The training shell also
+prepends `.venv/bin` to `PATH`, so using `export PATH=...` is enough even when
+the virtualenv activation script is not present.
+
+Before launching training, prepare these local paths:
+
+- OpenPangu-VL HuggingFace remote-code assets. The default config uses
+  `/root/shufangxun/Verl-Pangu30B/models/pangu30b_vl_clean` for
+  `model.config_path` and `model.tokenizer_path`.
+- Local prepared training shards referenced by
+  `configs/multimodal/data/qwen3_siglip_stage2_full.yaml`.
+- A writable experiment directory. The default is
+  `exp/openpangu-vl-30a3b-sft`.
+
+The default training config is:
 
 ```text
 configs/multimodal/openpangu_vl/30a3b/stage2_full.yaml
+```
+
+The default shell entrypoint is:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 NPROC_PER_NODE=4 \
+  bash shells/multimodal/panguvl_moe/stage2_full.sh
+```
+
+`NPROC_PER_NODE` should match the number of visible GPUs. The default
+`train.accelerator.ep_size: 2` must divide the total distributed world size.
+If W&B is enabled in the config, set `WANDB_API_KEY` or run `wandb login`; the
+default OpenPangu-VL config keeps W&B disabled.
+
+For a quick end-to-end smoke run, keep checkpoints off and stop after a few
+steps:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 NPROC_PER_NODE=4 \
+  bash shells/multimodal/panguvl_moe/stage2_full.sh \
+  --train.max_steps 2 \
+  --train.checkpoint.save_steps 0 \
+  --train.checkpoint.save_hf_weights false \
+  --train.wandb.enable false
 ```
 
 ## Data Preparation
