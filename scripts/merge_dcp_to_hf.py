@@ -185,15 +185,21 @@ def merge_to_hf_pt(
     save_model_weights(save_path, load_dir, shard_size=shard_size, model_assets=model_assets)
 
     if model_assets_dir is not None:
-        asset_names = (
+        asset_names = [
             "config.json",
             "generation_config.json",
+            "chat_template.json",
             "preprocessor_config.json",
             "processor_config.json",
             "tokenizer.json",
             "tokenizer_config.json",
             "special_tokens_map.json",
             "chat_template.jinja",
+        ]
+        asset_names.extend(
+            filename
+            for filename in sorted(os.listdir(model_assets_dir))
+            if filename.endswith(".py") and os.path.isfile(os.path.join(model_assets_dir, filename))
         )
         os.makedirs(save_path, exist_ok=True)
         copied = []

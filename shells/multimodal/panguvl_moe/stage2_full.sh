@@ -9,7 +9,7 @@ export PATH="${ROOT_DIR}/.venv/bin:${PATH}"
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
-CONFIG="${CONFIG:-configs/multimodal/openpangu_vl/30a3b/sft.yaml}"
+CONFIG="${CONFIG:-configs/multimodal/openpangu_vl/30a3b/stage2_full.yaml}"
 
 if [[ "${WANDB_MODE:-}" != "disabled" && "${WANDB_DISABLED:-}" != "true" ]] \
   && grep -qE '^[[:space:]]+enable:[[:space:]]+true[[:space:]]*$' "${CONFIG}" \
