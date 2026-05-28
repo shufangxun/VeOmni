@@ -75,7 +75,11 @@ class CheckpointerCallback(Callback):
         if getattr(self.trainer.checkpointer, "save_future", None) is not None:  # async save
             self.trainer.checkpointer.save_future.result()
 
-        self.trainer.checkpointer.load(args.train.checkpoint.load_path, state)
+        self.trainer.checkpointer.load(
+            args.train.checkpoint.load_path,
+            state,
+            trainable_only=bool(getattr(args.model, "lora_config", None)),
+        )
 
         self.trainer.state.global_step = state["extra_state"]["global_step"]
         self.trainer.start_epoch = self.trainer.state.global_step // args.train_steps
@@ -118,7 +122,22 @@ class CheckpointerCallback(Callback):
                 "torch_rng_state": torch.get_rng_state(),
             },
         }
-        self.trainer.checkpointer.save(save_checkpoint_path, ckpt_state, save_async=args.train.checkpoint.save_async)
+
+        # Free the training step's residual activations / autograd buffers
+        # before DCP allocates NCCL collective buffers for the gather.
+        # Mirrors the existing post-save ``empty_cache()`` below; without
+        # this pre-save call the save can fight the training step for HBM
+        # (observed as ``NCCL WARN Cuda failure 2 'out of memory'`` inside
+        # dcp.save on Qwen3.5-35B-a3b VL h100x16). Cost: one ``cudaFree``
+        # per ``save_steps``, well below noise.
+        helper.empty_cache()
+
+        self.trainer.checkpointer.save(
+            save_checkpoint_path,
+            ckpt_state,
+            save_async=args.train.checkpoint.save_async,
+            trainable_only=bool(getattr(args.model, "lora_config", None)),
+        )
 
         # Empty cache and barrier
         helper.empty_cache()

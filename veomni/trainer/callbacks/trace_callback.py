@@ -33,6 +33,8 @@ if TYPE_CHECKING:
 
 
 class MoERouterMonitorCallback(Callback):
+    """Monitors MoE expert load distribution and optional aux-free bias updates."""
+
     def __init__(self, trainer: "BaseTrainer") -> None:
         super().__init__(trainer)
         self.monitor = None
@@ -45,28 +47,57 @@ class MoERouterMonitorCallback(Callback):
         self._aux_free_enabled = args.train.moe_load_balance_strategy == "aux_free" or bool(
             args.train.moe_aux_free_load_balance
         )
-        if not self._wandb_monitor_enabled and not self._aux_free_enabled:
+        self._interval_monitor_enabled = args.train.moe_load_balance_monitor_interval > 0
+        if not self._interval_monitor_enabled and not self._aux_free_enabled:
             logger.info_rank0("MoE router monitor disabled.")
             return
 
         num_experts = self._get_num_experts(self.trainer.model_config)
-        if num_experts is not None:
-            from ...utils.moe_monitor import MoERouterMonitor, ensure_router_monitor_hooks, set_active_monitor
-
-            num_hooks = ensure_router_monitor_hooks(self.trainer.model)
-            self.monitor = MoERouterMonitor(num_experts)
-            set_active_monitor(self.monitor)
-            logger.info_rank0(
-                f"MoE router monitor enabled: num_experts={num_experts}, "
-                f"interval={args.train.moe_load_balance_monitor_interval}, router_hooks={num_hooks}, "
-                f"aux_free_balance={self._aux_free_enabled}"
-            )
-        else:
+        if num_experts is None:
             logger.warning_rank0(
                 "MoE router monitor requested but model config has no expert-count field. "
                 "Expected one of num_experts, n_routed_experts, text_config.num_experts, "
                 "or text_config.n_routed_experts. MoE router monitor not activated."
             )
+            return
+
+        from ...utils.moe_monitor import MoERouterMonitor, set_active_monitor
+
+        # Process groups are read lazily in on_train_begin once the device
+        # mesh is guaranteed to be initialized.
+        self.monitor = MoERouterMonitor(num_experts=num_experts)
+        set_active_monitor(self.monitor)
+        ps = get_parallel_state()
+        logger.info_rank0(
+            f"MoE router monitor created: num_experts={num_experts}, "
+            f"interval={args.train.moe_load_balance_monitor_interval}, "
+            f"ep_size={ps.ep_size if ps.ep_enabled else 1}, "
+            f"aux_free_balance={self._aux_free_enabled}"
+        )
+
+    def on_train_begin(self, state: TrainerState, **kwargs) -> None:
+        if self.monitor is None:
+            return
+        from ...utils.moe_monitor import attach_moe_router_monitor
+
+        # fsdp_group is the dp_sp mesh dim — exactly the set of ranks that
+        # hold distinct token slices. EP is intentionally not in this group;
+        # see MoERouterMonitor.__init__ docstring.
+        self.monitor.dp_group = get_parallel_state().fsdp_group
+
+        attached = attach_moe_router_monitor(self.trainer.model, self.monitor)
+        if attached == 0:
+            logger.warning_rank0(
+                "MoE router monitor: no recognized router modules found in the model. "
+                "Disabling monitor. To add support for a new router class, register an "
+                "extractor in veomni/utils/moe_monitor.py (see ROUTER_EXTRACTORS)."
+            )
+            from ...utils.moe_monitor import set_active_monitor
+
+            set_active_monitor(None)
+            self.monitor = None
+        else:
+            logger.info_rank0(f"MoE router monitor: attached to {attached} router module(s).")
 
     @staticmethod
     def _get_num_experts(config: Any) -> int | None:
@@ -94,29 +125,62 @@ class MoERouterMonitorCallback(Callback):
 
     def on_step_end(self, state: TrainerState, **kwargs) -> None:
         args: "VeOmniArguments" = self.trainer.args
-        if not self.monitor:
+        if self.monitor is None:
             return
 
         from ...utils.moe_monitor import MoERouterMonitor
 
-        counts, modules = self.monitor.drain_counts(current_step=state.global_step)
-        should_log = (
-            self._wandb_monitor_enabled and state.global_step % args.train.moe_load_balance_monitor_interval == 0
+        on_interval = (
+            self._interval_monitor_enabled and state.global_step % args.train.moe_load_balance_monitor_interval == 0
         )
-        aux_free_metrics = {}
-        if self._aux_free_enabled:
-            aux_free_metrics = MoERouterMonitor.update_aux_free_bias(
-                counts,
-                modules,
-                update_rate=args.train.moe_aux_free_load_balance_update_rate,
-                return_metrics=should_log,
+        should_log = self._wandb_monitor_enabled and on_interval
+        if not self._aux_free_enabled:
+            if not on_interval:
+                return
+            # compute_metrics runs an all-reduce across the DP/SP group, so every
+            # rank must call it. Non-logging ranks skip CPU formatting.
+            metrics = self.monitor.compute_metrics(
+                current_step=state.global_step,
+                format_only_on=args.train.global_rank == 0 and args.train.wandb.enable,
             )
-            if counts.numel() > 0 and not aux_free_metrics and not self._aux_free_no_bias_warned:
-                logger.warning_rank0(
-                    "Auxiliary-loss-free MoE load balancing is enabled, but no recorded MoE module exposes "
-                    "'e_score_correction_bias'. No expert bias was updated."
-                )
-                self._aux_free_no_bias_warned = True
+            if not metrics or args.train.global_rank != 0:
+                return
+
+            import wandb
+
+            wandb_metrics = {}
+            for k, v in metrics.items():
+                if k.endswith("expert_load_heatmap"):
+                    start, end = self.monitor._last_step_range
+                    wandb_metrics[k] = wandb.Image(v, caption=f"Steps {start}-{end}")
+                else:
+                    wandb_metrics[k] = v
+            wandb.log(wandb_metrics, step=state.global_step)
+
+            start, end = self.monitor._last_step_range
+            logger.info_rank0(
+                f"Step {state.global_step}: uploaded MoE load balance heatmap "
+                f"(steps {start}-{end}), "
+                f"max_vio max={metrics['moe/max_vio/max']:.4f} avg={metrics['moe/max_vio/avg']:.4f}, "
+                f"min_vio max={metrics['moe/min_vio/max']:.4f} avg={metrics['moe/min_vio/avg']:.4f}, "
+                f"avg_vio max={metrics['moe/avg_vio/max']:.4f} avg={metrics['moe/avg_vio/avg']:.4f}."
+            )
+            return
+
+        counts, modules = self.monitor.drain_counts(current_step=state.global_step)
+        aux_free_metrics = {}
+        aux_free_metrics = MoERouterMonitor.update_aux_free_bias(
+            counts,
+            modules,
+            update_rate=args.train.moe_aux_free_load_balance_update_rate,
+            return_metrics=should_log,
+        )
+        if counts.numel() > 0 and not aux_free_metrics and not self._aux_free_no_bias_warned:
+            logger.warning_rank0(
+                "Auxiliary-loss-free MoE load balancing is enabled, but no recorded MoE module exposes "
+                "'e_score_correction_bias'. No expert bias was updated."
+            )
+            self._aux_free_no_bias_warned = True
 
         if counts.numel() == 0:
             if args.train.global_rank == 0 and should_log:
@@ -124,9 +188,6 @@ class MoERouterMonitorCallback(Callback):
                     f"Step {state.global_step}: MoE router monitor has no recorded data. "
                     "Check that router forward hooks or direct MoE block recording are active."
                 )
-            return
-
-        if not self._wandb_monitor_enabled:
             return
 
         load_matrix = MoERouterMonitor.counts_to_load_matrix(counts)
@@ -139,13 +200,15 @@ class MoERouterMonitorCallback(Callback):
                 )
             return
 
-        if self._wandb_monitor_enabled:
-            maxvio_batch = MoERouterMonitor.compute_maxvio_batch(load_matrix).item()
-            if not math.isnan(maxvio_batch):
-                self._maxvio_batch_sum += maxvio_batch
-                self._maxvio_batch_count += 1
+        maxvio_batch = MoERouterMonitor.compute_maxvio_batch(load_matrix).item()
+        if not math.isnan(maxvio_batch):
+            self._maxvio_batch_sum += maxvio_batch
+            self._maxvio_batch_count += 1
 
         if not should_log:
+            if on_interval:
+                self._maxvio_batch_sum = 0.0
+                self._maxvio_batch_count = 0
             return
 
         metrics = self._build_wandb_metrics(self._maxvio_batch_sum, self._maxvio_batch_count, aux_free_metrics)

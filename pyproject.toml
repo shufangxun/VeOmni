@@ -34,6 +34,10 @@ dependencies = [
   "wandb",
   "setuptools",
   "einops>=0.8.1",
+  # matplotlib is used by veomni.utils.moe_monitor to render the per-step
+  # MoE expert-load heatmap that gets logged to wandb. Falls back to scalar
+  # metrics only if matplotlib is missing.
+  "matplotlib>=3.7",
 ]
 
 [project.optional-dependencies]
@@ -59,7 +63,7 @@ video = [
   "soundfile>=0.13.1,<0.14"
 ]
 dit = [
-  "diffusers==0.36.0",
+  "diffusers==0.37.0",
   "torchcodec",
   "av>=14.3.0,<15.0; python_version == '3.11'",
   "av>=14.0.0,<14.3; python_version == '3.12'",

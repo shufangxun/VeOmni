@@ -68,7 +68,7 @@ from veomni.models.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config import (
 )
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
-from veomni.utils.model_outputs import MoeCausalLMOutputWithLogProbs
+from veomni.utils.model_outputs import FusedLinearAuxOutputMixin, MoeCausalLMOutputWithLogProbs
 from veomni.utils.moe_router_replay import get_active_replay, maybe_replay_indices
 
 
@@ -86,7 +86,6 @@ config.add_import("functools", names=["partial"])
 config.add_import("types", names=["SimpleNamespace"])
 config.add_import("torch.distributed", alias="dist", is_from_import=False)
 config.add_import("veomni.distributed.parallel_state", names=["get_parallel_state"])
-config.add_import("veomni.ops", names=["fused_moe_forward"])
 config.add_import("veomni.utils.device", names=["get_device_id"])
 config.add_import(
     "veomni.distributed.sequence_parallel.ulysses",
@@ -100,7 +99,10 @@ config.add_import(
 config.add_import("veomni.utils.constants", names=["IMAGE_INPUT_INDEX", "VIDEO_INPUT_INDEX"])
 # Surface ``MoeCausalLMOutputWithLogProbs`` so the patched text ``forward`` can return
 # per-token log-probs in the unified MoE output dataclass.
-config.add_import("veomni.utils.model_outputs", names=["MoeCausalLMOutputWithLogProbs"])
+config.add_import(
+    "veomni.utils.model_outputs",
+    names=["FusedLinearAuxOutput", "FusedLinearAuxOutputMixin", "MoeCausalLMOutputWithLogProbs"],
+)
 config.add_import("veomni.utils.moe_router_replay", names=["get_active_replay", "maybe_replay_indices"])
 config.drop_import_names(
     "FusedRMSNormGated",
@@ -371,6 +373,27 @@ def qwen3_5_moe_model_forward_patched(
             flash_attn_kwargs[key] = kwargs.pop(key)
     # --- Patch.4 ---
 
+    # --- Patch.6 ---
+    # Mirror of qwen3_5: unpack per-modality ViT kwargs from
+    # `multimodal_metadata` (collator-precomputed) so the patched ViT
+    # forward can skip the in-forward .tolist() / cu_seqlens build.
+    multimodal_metadata = kwargs.pop("multimodal_metadata", None) or {}
+    image_vit_kwargs = {
+        "vit_metadata": {
+            "grid_thw_list": multimodal_metadata.get("image_grid_thw_list"),
+            "cu_seqlens": multimodal_metadata.get("vit_image_cu_seqlens"),
+            "max_seqlen": multimodal_metadata.get("vit_image_max_seqlen"),
+        }
+    }
+    video_vit_kwargs = {
+        "vit_metadata": {
+            "grid_thw_list": multimodal_metadata.get("video_grid_thw_list"),
+            "cu_seqlens": multimodal_metadata.get("vit_video_cu_seqlens"),
+            "max_seqlen": multimodal_metadata.get("vit_video_max_seqlen"),
+        }
+    }
+    # --- Patch.6 ---
+
     # --- Patch.1: Support Ulysses SP by transposing layout for multimodal scattering ---
     if get_parallel_state().sp_enabled:
         # Transpose from (batch, local_seq, full_hidden) to (batch, full_seq, local_hidden).
@@ -383,7 +406,7 @@ def qwen3_5_moe_model_forward_patched(
 
     if pixel_values is not None:
         image_outputs: BaseModelOutputWithPooling = self.get_image_features(
-            pixel_values, image_grid_thw, return_dict=True
+            pixel_values, image_grid_thw, return_dict=True, **image_vit_kwargs
         )
         image_embeds = image_outputs.pooler_output
 
@@ -426,7 +449,7 @@ def qwen3_5_moe_model_forward_patched(
 
     if pixel_values_videos is not None:
         video_outputs: BaseModelOutputWithPooling = self.get_video_features(
-            pixel_values_videos, video_grid_thw, return_dict=True
+            pixel_values_videos, video_grid_thw, return_dict=True, **video_vit_kwargs
         )
         video_embeds = video_outputs.pooler_output
 
@@ -516,7 +539,7 @@ def qwen3_5_moe_model_forward_patched(
 # See qwen3_5_gpu_patch_gen_config.py for why @auto_docstring is skipped.
 @config.add_helper_after("Qwen3_5MoeCausalLMOutputWithPast")
 @dataclass
-class Qwen3_5MoeCausalLMOutputWithLogProbs(Qwen3_5MoeCausalLMOutputWithPast):
+class Qwen3_5MoeCausalLMOutputWithLogProbs(FusedLinearAuxOutputMixin, Qwen3_5MoeCausalLMOutputWithPast):
     r"""
     loss (`torch.FloatTensor` of shape `(1,)`, *optional*, returned when `labels` is provided):
         Language modeling loss (for next-token prediction).
@@ -524,14 +547,12 @@ class Qwen3_5MoeCausalLMOutputWithLogProbs(Qwen3_5MoeCausalLMOutputWithPast):
         Prediction scores of the language modeling head (scores for each vocabulary token before SoftMax).
     rope_deltas (`torch.LongTensor` of shape `(batch_size, )`, *optional*):
         The rope index difference between sequence length and multimodal rope.
-    log_probs (`torch.FloatTensor`, *optional*):
-        Per-token log probabilities returned by VeOmni's fused loss path.
-    entropy (`torch.FloatTensor`, *optional*):
-        Per-token softmax entropy returned by VeOmni's fused loss path.
+    fused_linear_aux (`FusedLinearAuxOutput`, *optional*):
+        Per-token tensors produced by the fused-linear loss path
+        (``log_probs`` / ``entropy``; plus ``distillation_losses`` /
+        ``student_mass`` / ``teacher_mass`` on the top-k distillation path).
+        ``None`` on the plain loss path; populated when ``return_log_probs=True``.
     """
-
-    log_probs: torch.FloatTensor | None = None
-    entropy: torch.FloatTensor | None = None
 
 
 @config.add_helper
@@ -539,6 +560,62 @@ def get_position_id(main_func, self, **kwargs):
     # Must be a module-level function for multiprocessing pickle
     position_ids, rope_deltas = main_func(self, **kwargs)
     return {"position_ids": position_ids, "rope_deltas": rope_deltas}
+
+
+@config.add_helper
+def collate_multimodal_metadata(batch, sp_pad):
+    """Derive ``multimodal_metadata`` for the Qwen3.5-VL-MoE ViT.
+
+    Module-level so ``get_metadata_collate_func`` can hand it to VeOmni's
+    collator as a picklable callable (mirrors ``get_position_id``). Runs
+    purely on CPU inside the collator after SP padding — every value it
+    produces (CPU int tensors / Python ints / lists) is consumed by the ViT
+    forward without a host-device sync.
+
+    ``batch`` is the packed (+ SP-padded) batch dict; ``sp_pad`` maps
+    ``pixel_values`` / ``pixel_values_videos`` to the number of patch rows
+    the SP collator appended. Mutates ``batch`` in place, writing
+    ``batch["multimodal_metadata"]``.
+    """
+    md = {}
+    # ViT varlen-attention metadata, derived from the HF processor's
+    # ``*_grid_thw`` CPU LongTensor (packed across the batch by the collator
+    # via DataCollateInfo pack_dim=0). ``.tolist()`` here is a pure-CPU op —
+    # the collator runs in dataloader workers, no host-device sync.
+    # Temporal unroll: each (t, h, w) expands to ``t`` cu steps of ``h * w``.
+    for modality, grid_key, pad_key in (
+        ("image", "image_grid_thw", "pixel_values"),
+        ("video", "video_grid_thw", "pixel_values_videos"),
+    ):
+        grid = batch.get(grid_key)
+        if grid is None:
+            continue
+        grid_list = grid.tolist() if torch.is_tensor(grid) else grid
+        if not grid_list:
+            continue
+        md[f"{modality}_grid_thw_list"] = grid_list
+        cu = [0]
+        max_hw = 0
+        for t, h, w in grid_list:
+            hw = h * w
+            max_hw = max(max_hw, hw)
+            for _ in range(t):
+                cu.append(cu[-1] + hw)
+        # SP-pad tail: the collator zero-pads pixel_values to SP-divisible;
+        # those patches become one synthetic "image" so varlen attention
+        # treats them as an independent sequence (mirrors the position_ids==0
+        # text-side SP-pad convention). Discarded after the per-rank slice.
+        pad = sp_pad.get(pad_key, 0)
+        if pad > 0:
+            cu.append(cu[-1] + pad)
+            max_hw = max(max_hw, pad)
+        # device='cpu': this runs in CPU dataloader workers — pin to CPU so a
+        # global torch.set_default_device('cuda') can't misallocate it.
+        md[f"vit_{modality}_cu_seqlens"] = torch.tensor(cu, dtype=torch.int32, device="cpu")
+        md[f"vit_{modality}_max_seqlen"] = max_hw
+
+    if md:
+        batch["multimodal_metadata"] = md
 
 
 @config.override_method(
@@ -551,6 +628,17 @@ def qwen3_5_moe_forconditional_generation_get_position_id_func(self):
     fake_config.video_token_id = VIDEO_INPUT_INDEX
     fake_model = SimpleNamespace(config=fake_config)
     return partial(get_position_id, Qwen3_5MoeModel.get_rope_index, fake_model)  # noqa: F821
+
+
+@config.override_method(
+    "Qwen3_5MoeForConditionalGeneration.get_metadata_collate_func",
+    description="Expose CPU-side ViT multimodal-metadata derivation to the VeOmni collator",
+)
+def qwen3_5_moe_forconditional_generation_get_metadata_collate_func(self):
+    # collate_multimodal_metadata is a module-level helper (added via
+    # add_helper) — a bare function reference is picklable for the DataLoader
+    # workers; the Qwen3.5-VL-MoE ViT formula needs no model config.
+    return collate_multimodal_metadata  # noqa: F821 defined via add_helper
 
 
 # ── MoE Expert replacement (merged gate_up_proj layout) ─────────────────────────
@@ -772,12 +860,11 @@ def qwen3_5_moe_forcausallm_forward_patched(
 
     loss = None
     logits = None
-    log_probs = None
-    entropy = None
+    fused_linear_aux = None
     if labels is not None:
         # Modification: OpSlot guard for cross-entropy loss.
         if veomni_causal_lm_loss.use_non_eager_impl:
-            loss, logits, log_probs, entropy = veomni_causal_lm_loss(
+            loss, logits, fused_linear_aux = veomni_causal_lm_loss(
                 logits=logits,
                 labels=labels,
                 vocab_size=self.config.vocab_size,
@@ -788,9 +875,9 @@ def qwen3_5_moe_forcausallm_forward_patched(
         else:
             logits = self.lm_head(hidden_states)
             # Modification: VeOmni's patched `loss_function` (via LOSS_MAPPING)
-            # returns (loss, logits, log_probs, entropy); unpack to match the
+            # returns (loss, logits, fused_linear_aux); unpack to match the
             # OpSlot branch above.
-            loss, logits, log_probs, entropy = self.loss_function(
+            loss, _, fused_linear_aux = self.loss_function(
                 logits=logits,
                 labels=labels,
                 vocab_size=self.config.vocab_size,
@@ -798,6 +885,10 @@ def qwen3_5_moe_forcausallm_forward_patched(
                 weights=self.lm_head.weight,
                 **kwargs,
             )
+            if fused_linear_aux is not None:
+                # fused_linear_aux path empties loss/logits slots; clear the local 3D
+                # logits so output mirrors the OpSlot branch's contract.
+                logits = None
     else:
         logits = self.lm_head(hidden_states)
 
@@ -829,8 +920,7 @@ def qwen3_5_moe_forcausallm_forward_patched(
         hidden_states=outputs.hidden_states,
         attentions=outputs.attentions,
         router_logits=outputs.router_logits,
-        log_probs=log_probs,
-        entropy=entropy,
+        fused_linear_aux=fused_linear_aux,
     )
 
 
@@ -878,12 +968,11 @@ def qwen3_5_moe_forconditional_generation_forward_patched(
 
     loss = None
     logits = None
-    log_probs = None
-    entropy = None
+    fused_linear_aux = None
     if labels is not None:
         # Modification: OpSlot guard for cross-entropy loss.
         if veomni_causal_lm_loss.use_non_eager_impl:
-            loss, logits, log_probs, entropy = veomni_causal_lm_loss(
+            loss, logits, fused_linear_aux = veomni_causal_lm_loss(
                 logits=logits,
                 labels=labels,
                 vocab_size=self.config.text_config.vocab_size,
@@ -894,9 +983,9 @@ def qwen3_5_moe_forconditional_generation_forward_patched(
         else:
             logits = self.lm_head(hidden_states)
             # Modification: VeOmni's patched `loss_function` (via LOSS_MAPPING)
-            # returns (loss, logits, log_probs, entropy); unpack to match the
+            # returns (loss, logits, fused_linear_aux); unpack to match the
             # OpSlot branch above.
-            loss, logits, log_probs, entropy = self.loss_function(
+            loss, _, fused_linear_aux = self.loss_function(
                 logits=logits,
                 labels=labels,
                 vocab_size=self.config.text_config.vocab_size,
@@ -904,6 +993,10 @@ def qwen3_5_moe_forconditional_generation_forward_patched(
                 weights=self.lm_head.weight,
                 **kwargs,
             )
+            if fused_linear_aux is not None:
+                # fused_linear_aux path empties loss/logits slots; clear the local 3D
+                # logits so output mirrors the OpSlot branch's contract.
+                logits = None
     else:
         logits = self.lm_head(hidden_states)
 
@@ -936,8 +1029,7 @@ def qwen3_5_moe_forconditional_generation_forward_patched(
         attentions=outputs.attentions,
         router_logits=outputs.router_logits,
         rope_deltas=outputs.rope_deltas,
-        log_probs=log_probs,
-        entropy=entropy,
+        fused_linear_aux=fused_linear_aux,
     )
 
 

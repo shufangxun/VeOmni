@@ -265,22 +265,30 @@ class VLMTrainer:
         )
 
     def _build_collate_fn(self):
-        if self.base.model_config.model_type in ("qwen2_5_omni", "qwen3_omni_moe"):
+        model = self.base.model
+        # The model owns its modality-specific collate topology when available.
+        get_extra_infos = getattr(model, "get_extra_collate_infos", None)
+        data_collate_info = get_extra_infos() if get_extra_infos is not None else None
+        if data_collate_info is None and self.base.model_config.model_type in ("qwen2_5_omni", "qwen3_omni_moe"):
             data_collate_info = {
                 "audio_feature_lengths": (0, False, None, None),
                 "input_features": (0, True, 0, 1),
                 "audio_mask": (-1, False, 0, 1),
             }
-        else:
+        elif data_collate_info is None:
             data_collate_info = {}
         if self.base.model_config.model_type == "qwen3_moe_siglip_vlm":
             data_collate_info["router_attention_mask"] = (-1, True, 0, 1)
+        get_metadata_func = getattr(model, "get_metadata_collate_func", None)
+        metadata_collate_func = get_metadata_func() if get_metadata_func is not None else None
+
         seq_classification = self.base.args.data.data_type == "classification"
         pad_to_length = self.base.args.train.pad_to_length
         self.base.collate_fn = MainCollator(
             pad_to_length=pad_to_length,
             seq_classification=seq_classification,
             data_collate_info=data_collate_info,
+            metadata_collate_func=metadata_collate_func,
         )
 
     def _build_optimizer(self):

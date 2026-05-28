@@ -546,7 +546,11 @@ class TrainingArguments:
     moe_load_balance_monitor_interval: int = field(
         default=0,
         metadata={
-            "help": "Log paper-style training-batch MoE MaxVio every N steps. 0 = disabled. Requires wandb.enable=True."
+            "help": (
+                "Log MoE expert load metrics every N steps. 0 = disabled. Counts are all-reduced across "
+                "the DP/SP group so metrics are global. Wandb logging is performed only when "
+                "train.wandb.enable=True."
+            )
         },
     )
     moe_load_balance_strategy: Literal["auto", "none", "aux_loss", "aux_free"] = field(
@@ -774,6 +778,7 @@ class TrainingArguments:
 _NPU_ALLOWED: Dict[str, frozenset] = {
     "rms_norm_implementation": frozenset({"npu"}),
     "rotary_pos_emb_implementation": frozenset({"npu"}),
+    "rotary_pos_emb_vision_implementation": frozenset({"npu"}),
     "swiglu_mlp_implementation": frozenset(),
     "load_balancing_loss_implementation": frozenset({"triton"}),
     "cross_entropy_loss_implementation": frozenset({"chunk_loss", "npu"}),
@@ -783,6 +788,7 @@ _NPU_ALLOWED: Dict[str, frozenset] = {
 _NPU_REQUIRED: Dict[str, frozenset] = {
     "rms_norm_implementation": frozenset({"npu"}),
     "rotary_pos_emb_implementation": frozenset({"npu"}),
+    "rotary_pos_emb_vision_implementation": frozenset({"npu"}),
     "cross_entropy_loss_implementation": frozenset({"npu"}),
     "moe_implementation": frozenset({"fused_npu"}),
 }
@@ -869,6 +875,10 @@ class OpsImplementationConfig:
             "'npu' | 'triton' (DeepSeek-V3 deterministic; GPU only) | 'eager'."
         },
     )
+    rotary_pos_emb_vision_implementation: str = field(
+        default="eager",
+        metadata={"help": "Rotary positional embedding in vision part. 'npu' | 'eager' (default)."},
+    )
     load_balancing_loss_implementation: str = field(
         default="triton",
         metadata={
@@ -882,7 +892,7 @@ class OpsImplementationConfig:
             "help": "Gated RMSNorm implementation (Qwen3.5 GatedDeltaNet `self.norm`). "
             "'fla' (default) uses fla.modules.FusedRMSNormGated (requires flash-linear-attention, GPU). "
             "'eager' uses the HuggingFace Qwen3_5RMSNormGated. "
-            "Qwen3.5 has no NPU backend today — selecting any non-eager value on NPU raises at OpSlot bind time."
+            "'npu' uses the VeOmni NPUFusedRMSNormGated."
         },
     )
     causal_conv1d_implementation: str = field(
