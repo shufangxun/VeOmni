@@ -553,9 +553,7 @@ class BaseTrainer(Stateful, ABC):
         if isinstance(aux_loss, torch.Tensor) and router_aux_loss_coef is not None:
             # HF MoE models include router auxiliary loss in outputs.loss. Remove
             # it here and add it back with the same global-batch scaling used by
-            # non-token losses if the selected load-balance strategy uses aux loss.
-            # This keeps train.moe_load_balance_strategy='none' and 'aux_free' from
-            # silently retaining the model-added router aux loss.
+            # non-token losses.
             if isinstance(losses, torch.Tensor):
                 aux_contribution = aux_loss.to(losses.device) * router_aux_loss_coef
                 losses = losses - aux_contribution
@@ -579,17 +577,8 @@ class BaseTrainer(Stateful, ABC):
                 loss = loss + weighted_aux_loss
         return loss, loss_dict
 
-    def _get_moe_load_balance_strategy(self) -> str:
-        train_args = getattr(getattr(self, "args", None), "train", None)
-        strategy = getattr(train_args, "moe_load_balance_strategy", "auto")
-        if getattr(train_args, "moe_aux_free_load_balance", False) and strategy == "auto":
-            return "aux_free"
-        return strategy
-
     def _use_router_aux_loss(self, router_aux_loss_coef: float | None) -> bool:
-        if router_aux_loss_coef is None:
-            return False
-        return self._get_moe_load_balance_strategy() in {"auto", "aux_loss"}
+        return router_aux_loss_coef is not None
 
     def _get_router_aux_loss_coef(self) -> float | None:
         """Return the router auxiliary loss coefficient for dense or wrapped MoE configs."""

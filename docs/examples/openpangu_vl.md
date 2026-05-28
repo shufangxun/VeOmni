@@ -208,26 +208,16 @@ Important fields:
   `train.checkpoint.save_hf_weights: true` plus `hf_save_steps` or
   `hf_save_epochs` if you want VeOmni to export HF weights during training.
 
-Load-balancing strategy is configured explicitly:
+MoE load-balance monitoring is controlled by the logging interval:
 
 ```yaml
 train:
-  moe_load_balance_strategy: aux_free
-  moe_aux_free_load_balance_update_rate: 0.001
+  moe_load_balance_monitor_interval: 1
 ```
 
-Valid values:
-
-- `auto`: preserve model defaults. Models with `router_aux_loss_coef` continue
-  to use the existing differentiable router auxiliary loss.
-- `none`: disable trainer-added MoE load balancing. If a HuggingFace-style
-  model already added router aux loss to `outputs.loss`, VeOmni removes it and
-  does not add it back.
-- `aux_loss`: use the existing differentiable load-balancing loss path.
-- `aux_free`: use per-step expert-bias updates and do not add router aux loss
-  to the training objective.
-
-`aux_free` and `aux_loss` are mutually exclusive; do not configure both.
+Set it to `0` to disable monitor collection. Positive values aggregate router
+expert selections over that many training steps and log the official MoE
+violation metrics when wandb logging is enabled.
 
 ## Key Adaptation Items
 
@@ -355,12 +345,14 @@ logs coarse training metrics and finer-grained multimodal/MoE signals:
   `text_knowledge`, and `text_sft`.
 - `perf/*`: throughput and MFU-style performance counters.
 - `memory/*`: GPU and CPU memory usage.
-- MoE load-balance metrics: MaxVio and related expert-utilization summaries
-  when `train.moe_load_balance_monitor_interval` is non-zero.
+- MoE load-balance metrics: expert-load heatmaps plus `max_vio`,
+  `min_vio`, and `avg_vio` summaries when
+  `train.moe_load_balance_monitor_interval` is non-zero.
 
-`train.moe_load_balance_monitor_interval` controls MaxVio logging frequency.
-Aux-free balancing does not require W&B; the expert-count all-reduce is small,
-with payload size roughly:
+`train.moe_load_balance_monitor_interval` controls the monitor aggregation
+cadence. Monitor collection does not require W&B, but heatmap/scalar logging is
+emitted only when W&B logging is enabled on rank 0. The expert-count all-reduce
+is small, with payload size roughly:
 
 ```text
 num_moe_layers * n_routed_experts * sizeof(float32)

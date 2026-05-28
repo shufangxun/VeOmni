@@ -27,12 +27,9 @@ Single-process tests covering the public surface:
 
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 import torch
 import torch.nn as nn
 
-from veomni.trainer.callbacks.trace_callback import MoERouterMonitorCallback
 from veomni.utils import moe_monitor
 from veomni.utils.moe_monitor import (
     EXTERNAL_RECORD_ROUTERS,
@@ -207,61 +204,6 @@ def test_compute_vio_numerics():
     assert torch.allclose(vio_c["avg_vio"], torch.tensor([1.5]))
 
 
-def test_compute_maxvio_batch_averages_layer_maxvio():
-    load_matrix = torch.tensor(
-        [
-            [0.5, 0.25, 0.25, 0.0],
-            [0.25, 0.25, 0.25, 0.25],
-        ]
-    )
-
-    assert torch.allclose(MoERouterMonitor.compute_maxvio_batch(load_matrix), torch.tensor(0.5))
-
-
-def test_moe_router_monitor_reads_nested_text_config_num_experts():
-    config = SimpleNamespace(text_config=SimpleNamespace(num_experts=128))
-
-    assert MoERouterMonitorCallback._get_num_experts(config) == 128
-
-
-def test_moe_router_monitor_reads_pangu_routed_experts():
-    config = SimpleNamespace(text_config=SimpleNamespace(n_routed_experts=256))
-
-    assert MoERouterMonitorCallback._get_num_experts(config) == 256
-
-
-def test_moe_router_monitor_wandb_metrics_include_batch_maxvio():
-    metrics = MoERouterMonitorCallback._build_wandb_metrics(maxvio_batch_sum=1.5, maxvio_batch_count=3)
-
-    assert metrics == {"moe/maxvio_batch": 0.5}
-
-
-def test_record_ignores_eval_modules():
-    monitor = MoERouterMonitor(num_experts=4)
-    module = nn.Linear(1, 1)
-    module.eval()
-
-    monitor.record(module, torch.tensor([[0, 1]]))
-
-    assert torch.equal(monitor.get_load_matrix(), torch.zeros(0, 4))
-
-
-def test_aux_free_bias_update_uses_count_sign_and_resets():
-    monitor = MoERouterMonitor(num_experts=4)
-    module = nn.Module()
-    module.e_score_correction_bias = torch.zeros(4)
-    module.train()
-    monitor.record(module, torch.tensor([[0, 0], [0, 1], [2, 3]]))
-
-    counts, modules = monitor.drain_counts()
-    metrics = MoERouterMonitor.update_aux_free_bias(counts, modules, update_rate=0.1, return_metrics=True)
-
-    assert torch.allclose(module.e_score_correction_bias, torch.tensor([-0.1, 0.1, 0.1, 0.1]))
-    assert metrics["moe/aux_free_bias_updated_layers"] == 1.0
-    assert abs(metrics["moe/aux_free_bias_max_abs"] - 0.1) < 1e-6
-    assert torch.equal(monitor.get_load_matrix(), torch.zeros(1, 4))
-
-
 def test_compute_metrics_key_shape():
     monitor, model = _make_monitor_and_attach(num_experts=4, top_k=2)
     try:
@@ -284,8 +226,7 @@ def test_compute_metrics_key_shape():
             }
         )
         assert set(metrics.keys()) == expected_keys
-        heatmap = metrics["moe/expert_load_heatmap"]
-        assert heatmap is None or heatmap.__class__.__module__.startswith("PIL.")
+        assert metrics["moe/expert_load_heatmap"].__class__.__module__.startswith("PIL.")
     finally:
         set_active_monitor(None)
 
@@ -344,7 +285,7 @@ def test_extractor_returning_none_fails_loud():
 
 
 def test_attach_is_idempotent():
-    """Re-attaching to the same model must not duplicate rows or hooks."""
+    """Re-attaching to the same model must not duplicate heatmap rows."""
     monitor = MoERouterMonitor(num_experts=4)
     model = TwoLayerModel(num_experts=4, top_k=2)
     attach_moe_router_monitor(model, monitor)
@@ -355,11 +296,9 @@ def test_attach_is_idempotent():
         model.router0.set_next_indices(torch.zeros(4, 2, dtype=torch.long))
         model.router1.set_next_indices(torch.zeros(4, 2, dtype=torch.long))
         model(torch.zeros(4, 8))
-        # Two routers in the model -> exactly 2 rows, and each router should
-        # count 4 tokens * top_k=2 once. Duplicate hooks would double this.
-        counts, _ = monitor.drain_counts(current_step=0)
-        assert counts.shape == (2, 4), f"expected 2 rows, got {counts.shape}"
-        assert torch.equal(counts, torch.tensor([[8, 0, 0, 0], [8, 0, 0, 0]]))
+        # Two routers in the model -> exactly 2 rows.
+        load = monitor.get_load_matrix(current_step=0)
+        assert load.shape == (2, 4), f"expected 2 rows, got {load.shape}"
     finally:
         set_active_monitor(None)
 
@@ -389,18 +328,6 @@ def test_unfired_layers_appear_as_zero_rows():
         assert torch.allclose(load[1], torch.zeros(4))
     finally:
         set_active_monitor(None)
-
-
-def test_attached_but_unfired_layers_drain_zero_rows():
-    monitor = MoERouterMonitor(num_experts=4)
-    model = TwoLayerModel(num_experts=4, top_k=2)
-    attach_moe_router_monitor(model, monitor)
-
-    counts, modules = monitor.drain_counts(current_step=1)
-
-    assert counts.shape == (2, 4)
-    assert torch.equal(counts, torch.zeros(2, 4, dtype=torch.long))
-    assert modules == [model.router0, model.router1]
 
 
 def test_deepseek_v3_style_external_record_path():

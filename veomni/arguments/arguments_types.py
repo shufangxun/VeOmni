@@ -547,29 +547,11 @@ class TrainingArguments:
         default=0,
         metadata={
             "help": (
-                "Log MoE expert load metrics every N steps. 0 = disabled. Counts are all-reduced across "
-                "the DP/SP group so metrics are global. Wandb logging is performed only when "
-                "train.wandb.enable=True."
+                "Log MoE expert load heatmap every N steps. 0 = disabled. Counts are "
+                "all-reduced across EP and DP groups so the heatmap is global. "
+                "Wandb logging is performed only when train.wandb.enable=True."
             )
         },
-    )
-    moe_load_balance_strategy: Literal["auto", "none", "aux_loss", "aux_free"] = field(
-        default="auto",
-        metadata={
-            "help": (
-                "MoE load-balancing strategy. 'auto' preserves model defaults, 'none' disables trainer-added "
-                "MoE balancing, 'aux_loss' uses differentiable router aux loss, 'aux_free' uses per-step "
-                "expert-bias updates."
-            )
-        },
-    )
-    moe_aux_free_load_balance: bool = field(
-        default=False,
-        metadata={"help": "Deprecated compatibility switch. Prefer train.moe_load_balance_strategy='aux_free'."},
-    )
-    moe_aux_free_load_balance_update_rate: float = field(
-        default=1.0e-3,
-        metadata={"help": "Per-step update rate for auxiliary-loss-free MoE expert bias updates."},
     )
 
     # sub-argument groups
@@ -587,7 +569,6 @@ class TrainingArguments:
         self.world_size = int(os.getenv("WORLD_SIZE", 1))
 
         self._validate_accelerator()
-        self._validate_moe_load_balance()
         self._derive_batch_config()
         self._resolve_checkpoint_paths()
         self._resolve_profile()
@@ -648,28 +629,6 @@ class TrainingArguments:
                     "used with train.accelerator.fsdp_config.fsdp_mode='fsdp2'. "
                     f"Received fsdp_mode={acc.fsdp_config.fsdp_mode!r}. Disable this flag or switch to fsdp2.",
                 )
-
-    def _validate_moe_load_balance(self):
-        valid_strategies = {"auto", "none", "aux_loss", "aux_free"}
-        if self.moe_load_balance_strategy not in valid_strategies:
-            raise ValueError(
-                "`moe_load_balance_strategy` must be one of "
-                f"{sorted(valid_strategies)}, got {self.moe_load_balance_strategy!r}."
-            )
-        if self.moe_load_balance_monitor_interval < 0:
-            raise ValueError("`moe_load_balance_monitor_interval` must be non-negative.")
-        if self.moe_aux_free_load_balance:
-            if self.moe_load_balance_strategy in {"none", "aux_loss"}:
-                raise ValueError(
-                    "`moe_aux_free_load_balance=True` conflicts with "
-                    f"`moe_load_balance_strategy={self.moe_load_balance_strategy!r}`."
-                )
-            if self.moe_load_balance_strategy == "auto":
-                self.moe_load_balance_strategy = "aux_free"
-        if self.moe_load_balance_strategy == "aux_free" and self.moe_aux_free_load_balance_update_rate <= 0:
-            raise ValueError(
-                "`moe_aux_free_load_balance_update_rate` must be positive when aux-free balance is enabled."
-            )
 
     def _derive_batch_config(self):
         acc = self.accelerator

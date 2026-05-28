@@ -203,9 +203,7 @@ def attach_moe_router_monitor(model: nn.Module, monitor: "MoERouterMonitor") -> 
         cls_name = type(mod).__name__
         extractor = ROUTER_EXTRACTORS.get(cls_name)
         if extractor is not None:
-            if not getattr(mod, "_veomni_moe_monitor_hook_registered", False):
-                mod.register_forward_hook(_make_router_hook(extractor))
-                mod._veomni_moe_monitor_hook_registered = True
+            mod.register_forward_hook(_make_router_hook(extractor))
             monitor._register_layer(mod)
             attached += 1
         elif cls_name in EXTERNAL_RECORD_ROUTERS:
@@ -251,8 +249,6 @@ class MoERouterMonitor:
 
         # Layer order captured at attach time (stable across resumes).
         self._layer_order: List[int] = []
-        # Module handles aligned with layer order, used for aux-free bias updates.
-        self._modules: Dict[int, nn.Module] = {}
         # Per-module accumulated counts, lazily allocated on first record.
         self._counts: Dict[int, torch.Tensor] = {}
 
@@ -294,17 +290,10 @@ class MoERouterMonitor:
         mid = id(module)
         if mid not in self._layer_order:
             self._layer_order.append(mid)
-        self._modules[mid] = module
 
     def _reset_counts(self) -> None:
         for mid in self._counts:
             self._counts[mid].zero_()
-
-    def _infer_count_device(self) -> torch.device:
-        for module in self._modules.values():
-            for tensor in list(module.parameters(recurse=True)) + list(module.buffers(recurse=True)):
-                return tensor.device
-        return torch.device("cpu")
 
     # ---------------------- Recording ----------------------
 
@@ -313,8 +302,6 @@ class MoERouterMonitor:
 
         Called by the forward hook. Pure on-device accumulation.
         """
-        if not module.training:
-            return
         mid = id(module)
         if mid not in self._counts:
             # First-seen forward for this router — lazily allocate counts.
@@ -322,7 +309,6 @@ class MoERouterMonitor:
             # dynamically-added router), append to layer order now.
             if mid not in self._layer_order:
                 self._layer_order.append(mid)
-            self._modules[mid] = module
             self._counts[mid] = torch.zeros(self.num_experts, dtype=torch.long, device=router_indices.device)
         counts = torch.bincount(
             router_indices.reshape(-1).to(torch.long),
@@ -341,13 +327,13 @@ class MoERouterMonitor:
         included as zero rows so the heatmap shape stays stable across
         intervals.
         """
-        if not self._layer_order and not self._counts:
+        if not self._counts:
+            # No data recorded yet — return an empty tensor on CPU.
             return torch.zeros(0, self.num_experts, dtype=torch.long)
 
-        # Device hint from allocated counts or registered module parameters.
-        # Ranks with no local routed tokens still need a correctly placed zero
-        # matrix so every DP/SP rank participates in the same all-reduce.
-        device = next(iter(self._counts.values())).device if self._counts else self._infer_count_device()
+        # Device hint from any allocated counts tensor — we need it to
+        # synthesize zero rows for layers that haven't fired yet.
+        device = next(iter(self._counts.values())).device
         zero_row = torch.zeros(self.num_experts, dtype=torch.long, device=device)
         matrix = torch.stack([self._counts.get(mid, zero_row) for mid in self._layer_order])
 
@@ -358,22 +344,6 @@ class MoERouterMonitor:
         if self.dp_group is not None and dist.is_initialized():
             dist.all_reduce(matrix, op=dist.ReduceOp.SUM, group=self.dp_group)
         return matrix
-
-    def drain_counts(self, current_step: int = 0) -> tuple[torch.Tensor, list[nn.Module]]:
-        """Return raw per-layer counts and reset accumulated state.
-
-        The returned tensor stays on device so callers can update router bias
-        buffers without a host sync. The module list is aligned with the first
-        tensor dimension.
-        """
-        matrix = self._stack_and_reduce()
-        if matrix.numel() == 0:
-            return matrix, []
-        modules = [self._modules[mid] for mid in self._layer_order if mid in self._modules]
-        self._last_step_range = (self._accumulate_start_step, current_step)
-        self._reset_counts()
-        self._accumulate_start_step = current_step + 1
-        return matrix, modules
 
     def get_load_matrix(self, current_step: int = 0) -> torch.Tensor:
         """Return normalized ``[num_moe_layers, num_experts]`` load matrix and reset.
@@ -390,15 +360,6 @@ class MoERouterMonitor:
         self._reset_counts()
         self._accumulate_start_step = current_step + 1
         return matrix
-
-    @staticmethod
-    def counts_to_load_matrix(counts: torch.Tensor) -> torch.Tensor:
-        """Normalize raw expert counts into per-layer load frequencies."""
-        if counts.numel() == 0:
-            return counts.detach().cpu().float()
-        matrix = counts.detach().float().cpu()
-        row_sums = matrix.sum(dim=1, keepdim=True).clamp(min=1.0)
-        return matrix / row_sums
 
     @staticmethod
     def compute_vio(load_matrix: torch.Tensor) -> Dict[str, torch.Tensor]:
@@ -419,45 +380,6 @@ class MoERouterMonitor:
             "min_vio": deviation.min(dim=1).values,
             "avg_vio": deviation.abs().mean(dim=1),
         }
-
-    @staticmethod
-    def compute_maxvio_batch(load_matrix: torch.Tensor) -> torch.Tensor:
-        """Compute paper-style batch MaxVio averaged across MoE layers."""
-        if load_matrix.numel() == 0:
-            return torch.tensor(float("nan"))
-        return MoERouterMonitor.compute_vio(load_matrix)["max_vio"].mean()
-
-    @staticmethod
-    @torch.no_grad()
-    def update_aux_free_bias(
-        counts: torch.Tensor,
-        modules: list[nn.Module],
-        update_rate: float,
-        return_metrics: bool = False,
-    ) -> dict[str, float]:
-        """Apply auxiliary-loss-free per-expert bias updates."""
-        if counts.numel() == 0 or update_rate <= 0:
-            return {}
-
-        updated_layers = 0
-        max_abs_bias = 0.0
-        for layer_counts, module in zip(counts, modules):
-            bias = getattr(module, "e_score_correction_bias", None)
-            if not isinstance(bias, torch.Tensor):
-                continue
-            layer_counts = layer_counts.to(device=bias.device, dtype=bias.dtype)
-            error = layer_counts.mean() - layer_counts
-            bias.add_(float(update_rate) * error.sign())
-            updated_layers += 1
-            if return_metrics:
-                max_abs_bias = max(max_abs_bias, float(bias.detach().abs().max().item()))
-
-        if updated_layers == 0:
-            return {}
-        metrics = {"moe/aux_free_bias_updated_layers": float(updated_layers)}
-        if return_metrics:
-            metrics["moe/aux_free_bias_max_abs"] = max_abs_bias
-        return metrics
 
     def compute_metrics(
         self,
@@ -510,15 +432,11 @@ class MoERouterMonitor:
         """
         import io
 
-        try:
-            import matplotlib
+        import matplotlib
 
-            matplotlib.use("Agg")
-            import matplotlib.pyplot as plt
-            from PIL import Image
-        except ModuleNotFoundError:
-            logger.warning_once("MoE load heatmap skipped because matplotlib/PIL is not installed.")
-            return None
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from PIL import Image
 
         if caption is None:
             start, end = self._last_step_range

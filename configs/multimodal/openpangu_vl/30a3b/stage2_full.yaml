@@ -51,8 +51,6 @@ train:
   log_train_source_loss_steps: 5
   log_train_domain_loss_steps: 5
   moe_load_balance_monitor_interval: 1
-  moe_load_balance_strategy: aux_free
-  moe_aux_free_load_balance_update_rate: 0.001
   bsz_warmup_ratio: 0.01
   optimizer:
     type: adamw

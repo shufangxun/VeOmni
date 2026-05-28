@@ -25,7 +25,6 @@ from veomni.models.transformers.openpangu_vl.generated.patched_modeling_openpang
 )
 from veomni.ops import apply_ops_config
 from veomni.utils.constants import IGNORE_INDEX, IMAGE_INPUT_INDEX
-from veomni.utils.moe_monitor import MoERouterMonitor, set_active_monitor
 
 
 TOY_CONFIG = "tests/toy_config/openpangu_vl_toy"
@@ -70,30 +69,6 @@ def test_openpangu_vl_text_forward():
     assert outputs.loss is not None
     assert outputs.logits.shape == (1, 4, model.config.vocab_size)
     outputs.loss.backward()
-
-
-def test_openpangu_vl_aux_free_router_bias_updates():
-    model = _toy_model()
-    model.train()
-    input_ids = torch.tensor([[1, 7, 8, 9, 2]])
-    attention_mask = torch.ones_like(input_ids)
-    num_experts = model.model.language_model.config.n_routed_experts
-    monitor = MoERouterMonitor(num_experts=num_experts)
-
-    set_active_monitor(monitor)
-    try:
-        model(input_ids=input_ids, attention_mask=attention_mask, labels=input_ids)
-        counts, modules = monitor.drain_counts(global_reduce=False)
-    finally:
-        set_active_monitor(None)
-
-    assert counts.shape == (1, num_experts)
-    assert len(modules) == 1
-    assert hasattr(modules[0], "e_score_correction_bias")
-
-    metrics = MoERouterMonitor.update_aux_free_bias(counts, modules, update_rate=0.1, return_metrics=True)
-
-    assert metrics["moe/aux_free_bias_updated_layers"] == 1.0
 
 
 def test_openpangu_vl_text_forward_touches_vision_projection_under_fsdp(monkeypatch):

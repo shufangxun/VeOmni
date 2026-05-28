@@ -67,24 +67,3 @@ def test_base_trainer_postforward_scales_router_aux_loss(monkeypatch):
     torch.testing.assert_close(loss_dict["load_balancing_loss"], torch.tensor(4.0))
     torch.testing.assert_close(loss_dict["load_balancing_loss_weighted"], torch.tensor(0.004))
     torch.testing.assert_close(loss, torch.tensor(1.004))
-
-
-def test_base_trainer_postforward_disables_router_aux_loss_by_strategy(monkeypatch):
-    from veomni.trainer.base import BaseTrainer
-
-    _patch_parallel(monkeypatch, sp_enabled=True, sp_size=2, global_factor=4)
-    trainer = object.__new__(BaseTrainer)
-    trainer.micro_batch_token_len = {"foundation_tokens": torch.tensor(50)}
-    trainer.micro_batches_token_len = {"foundation_tokens": torch.tensor(100)}
-    trainer.model_config = SimpleNamespace(text_config=SimpleNamespace(router_aux_loss_coef=0.001))
-    trainer.args = SimpleNamespace(train=SimpleNamespace(moe_load_balance_strategy="aux_free"))
-
-    aux_loss = torch.tensor(8.0)
-    outputs = SimpleNamespace(loss=torch.tensor(2.008), aux_loss=aux_loss)
-
-    loss, loss_dict = trainer.postforward(outputs, {})
-
-    torch.testing.assert_close(loss_dict["foundation_loss"], torch.tensor(1.0))
-    torch.testing.assert_close(loss_dict["load_balancing_loss"], torch.tensor(4.0))
-    assert "load_balancing_loss_weighted" not in loss_dict
-    torch.testing.assert_close(loss, torch.tensor(1.0))

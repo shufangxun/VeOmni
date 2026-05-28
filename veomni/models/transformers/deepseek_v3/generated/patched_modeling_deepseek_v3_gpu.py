@@ -50,6 +50,7 @@ from transformers.utils import TransformersKwargs, auto_docstring, can_return_tu
 from transformers.utils.generic import is_flash_attention_requested, maybe_autocast, merge_with_config_defaults
 from transformers.utils.output_capturing import capture_outputs
 
+# Additional imports for patches
 from veomni.ops import fused_moe_forward
 
 # Additional import blocks for patches
