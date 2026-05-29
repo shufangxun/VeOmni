@@ -143,6 +143,7 @@ def register_external_record_router(class_name: str) -> None:
 
 
 register_external_record_router("DeepseekV3TopkRouter")
+register_external_record_router("OpenPanguV2SparseMoeBlock")
 
 
 def record_router_indices(router_module: nn.Module, indices: torch.Tensor) -> None:
@@ -249,6 +250,7 @@ class MoERouterMonitor:
 
         # Layer order captured at attach time (stable across resumes).
         self._layer_order: List[int] = []
+        self._modules: Dict[int, nn.Module] = {}
         # Per-module accumulated counts, lazily allocated on first record.
         self._counts: Dict[int, torch.Tensor] = {}
 
@@ -290,6 +292,7 @@ class MoERouterMonitor:
         mid = id(module)
         if mid not in self._layer_order:
             self._layer_order.append(mid)
+        self._modules[mid] = module
 
     def _reset_counts(self) -> None:
         for mid in self._counts:
@@ -309,6 +312,7 @@ class MoERouterMonitor:
             # dynamically-added router), append to layer order now.
             if mid not in self._layer_order:
                 self._layer_order.append(mid)
+            self._modules[mid] = module
             self._counts[mid] = torch.zeros(self.num_experts, dtype=torch.long, device=router_indices.device)
         counts = torch.bincount(
             router_indices.reshape(-1).to(torch.long),
@@ -345,21 +349,77 @@ class MoERouterMonitor:
             dist.all_reduce(matrix, op=dist.ReduceOp.SUM, group=self.dp_group)
         return matrix
 
+    def get_count_matrix(self, current_step: int = 0, reset: bool = True) -> torch.Tensor:
+        """Return reduced raw expert counts as ``[num_moe_layers, num_experts]`` on CPU."""
+        matrix = self._stack_and_reduce()
+        if matrix.numel() == 0:
+            return matrix.cpu()
+        matrix = matrix.cpu()
+        self._last_step_range = (self._accumulate_start_step, current_step)
+        if reset:
+            self._reset_counts()
+            self._accumulate_start_step = current_step + 1
+        return matrix
+
+    @staticmethod
+    def normalize_count_matrix(count_matrix: torch.Tensor) -> torch.Tensor:
+        """Normalize raw expert counts so every layer row sums to 1.0."""
+        matrix = count_matrix.float()
+        if matrix.numel() == 0:
+            return matrix
+        row_sums = matrix.sum(dim=1, keepdim=True).clamp(min=1.0)
+        return matrix / row_sums
+
     def get_load_matrix(self, current_step: int = 0) -> torch.Tensor:
         """Return normalized ``[num_moe_layers, num_experts]`` load matrix and reset.
 
         Rows sum to 1.0. Issues one CUDA sync via the host transfer.
         """
-        matrix = self._stack_and_reduce()
-        if matrix.numel() == 0:
-            return matrix.float()
-        matrix = matrix.float().cpu()
-        row_sums = matrix.sum(dim=1, keepdim=True).clamp(min=1.0)
-        matrix = matrix / row_sums
-        self._last_step_range = (self._accumulate_start_step, current_step)
-        self._reset_counts()
-        self._accumulate_start_step = current_step + 1
-        return matrix
+        return self.normalize_count_matrix(self.get_count_matrix(current_step=current_step, reset=True))
+
+    def update_aux_free_bias(self, count_matrix: torch.Tensor, update_rate: float) -> Dict[str, float]:
+        """Update expert-wise routing bias using auxiliary-loss-free balancing.
+
+        Overloaded experts receive ``-update_rate`` and underloaded experts receive
+        ``+update_rate``. The update is intentionally non-differentiable and only
+        affects the bias used for top-k routing decisions.
+        """
+        if count_matrix.numel() == 0 or update_rate == 0:
+            return {}
+
+        updated_layers = 0
+        max_abs_bias = 0.0
+        mean_abs_delta = 0.0
+        for row_idx, mid in enumerate(self._layer_order):
+            module = self._modules.get(mid)
+            if module is None or row_idx >= count_matrix.shape[0]:
+                continue
+
+            bias = getattr(module, "e_score_correction_bias", None)
+            if bias is None and hasattr(module, "gate"):
+                bias = getattr(module.gate, "e_score_correction_bias", None)
+            if not isinstance(bias, torch.Tensor) or bias.numel() != count_matrix.shape[1]:
+                continue
+
+            counts = count_matrix[row_idx].to(device=bias.device, dtype=torch.float32)
+            avg_count = counts.mean()
+            delta = torch.zeros_like(counts)
+            delta = torch.where(counts > avg_count, -update_rate, delta)
+            delta = torch.where(counts < avg_count, update_rate, delta)
+            with torch.no_grad():
+                bias.add_(delta.to(dtype=bias.dtype))
+                max_abs_bias = max(max_abs_bias, float(bias.detach().abs().max().item()))
+                mean_abs_delta += float(delta.abs().mean().item())
+            updated_layers += 1
+
+        if updated_layers == 0:
+            return {}
+        return {
+            "aux_free_bias/updated_layers": float(updated_layers),
+            "aux_free_bias/update_rate": float(update_rate),
+            "aux_free_bias/mean_abs_delta": mean_abs_delta / updated_layers,
+            "aux_free_bias/max_abs_bias": max_abs_bias,
+        }
 
     @staticmethod
     def compute_vio(load_matrix: torch.Tensor) -> Dict[str, torch.Tensor]:
@@ -402,7 +462,21 @@ class MoERouterMonitor:
 
         Returns an empty dict if no data was recorded or ``format_only_on`` is False.
         """
-        load_matrix = self.get_load_matrix(current_step=current_step)
+        count_matrix = self.get_count_matrix(current_step=current_step, reset=True)
+        return self.compute_metrics_from_counts(
+            count_matrix=count_matrix,
+            prefix=prefix,
+            format_only_on=format_only_on,
+        )
+
+    def compute_metrics_from_counts(
+        self,
+        count_matrix: torch.Tensor,
+        prefix: str = "moe",
+        format_only_on: Optional[bool] = None,
+    ) -> Dict[str, Any]:
+        """Produce metrics from a pre-reduced raw count matrix."""
+        load_matrix = self.normalize_count_matrix(count_matrix)
         num_layers = load_matrix.shape[0]
         if num_layers == 0 or format_only_on is False:
             return {}

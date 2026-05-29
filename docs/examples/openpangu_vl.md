@@ -208,16 +208,26 @@ Important fields:
   `train.checkpoint.save_hf_weights: true` plus `hf_save_steps` or
   `hf_save_epochs` if you want VeOmni to export HF weights during training.
 
-MoE load-balance monitoring is controlled by the logging interval:
+MoE load balancing is controlled by `train.moe_load_balance`. OpenPangu-V2
+uses auxiliary-loss-free balancing by updating the expert-wise routing bias
+after routing statistics are reduced:
 
 ```yaml
 train:
-  moe_load_balance_monitor_interval: 1
+  moe_load_balance:
+    mode: aux_free
+    monitor_interval: 1
+    log_to_console: true
+    aux_free_bias_update_rate: 1.0e-3
+    aux_free_update_interval: 1
 ```
 
-Set it to `0` to disable monitor collection. Positive values aggregate router
-expert selections over that many training steps and log the official MoE
-violation metrics when wandb logging is enabled.
+Set `mode: none` and `monitor_interval: 0` to disable collection. Positive
+`monitor_interval` values aggregate router expert selections over that many
+training steps and log MoE violation metrics to the console and to W&B when
+W&B logging is enabled. Standard auxiliary-loss balancing remains available
+for model families whose forward path emits `aux_loss` by setting
+`mode: aux_loss`.
 
 ## Key Adaptation Items
 
@@ -239,8 +249,8 @@ violation metrics when wandb logging is enabled.
   collectives across ranks.
 - Aux-free load balancing: OpenPangu-V2 routed experts expose
   `e_score_correction_bias`; VeOmni records selected experts per step, globally
-  reduces expert counts, and updates the bias without adding a differentiable
-  router loss.
+  reduces expert counts, and updates the bias by `aux_free_bias_update_rate`
+  without adding a differentiable router loss.
 
 ## Checkpoint Conversion and Inference
 
@@ -347,12 +357,12 @@ logs coarse training metrics and finer-grained multimodal/MoE signals:
 - `memory/*`: GPU and CPU memory usage.
 - MoE load-balance metrics: expert-load heatmaps plus `max_vio`,
   `min_vio`, and `avg_vio` summaries when
-  `train.moe_load_balance_monitor_interval` is non-zero.
+  `train.moe_load_balance.monitor_interval` is non-zero.
 
-`train.moe_load_balance_monitor_interval` controls the monitor aggregation
-cadence. Monitor collection does not require W&B, but heatmap/scalar logging is
-emitted only when W&B logging is enabled on rank 0. The expert-count all-reduce
-is small, with payload size roughly:
+`train.moe_load_balance.monitor_interval` controls the monitor aggregation
+cadence. Monitor collection does not require W&B; rank 0 logs scalar summaries
+to the console, and heatmap/scalar logging is also emitted to W&B when W&B is
+enabled. The expert-count all-reduce is small, with payload size roughly:
 
 ```text
 num_moe_layers * n_routed_experts * sizeof(float32)

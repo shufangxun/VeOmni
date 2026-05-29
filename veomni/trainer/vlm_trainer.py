@@ -518,7 +518,7 @@ class VLMTrainer:
         args: VeOmniVLMArguments = self.base.args
         self.base.state.global_step += 1
 
-        micro_batches: List[Dict[str, Any]] = next(data_iterator)
+        micro_batches: List[Dict[str, Any]] = self.base._next_train_micro_batches(data_iterator)
         log_train_source_loss = self._should_log_train_source_loss()
         log_train_domain_loss = self._should_log_train_domain_loss()
         log_train_group_loss = log_train_source_loss or log_train_domain_loss

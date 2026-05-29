@@ -434,6 +434,57 @@ class CheckpointConfig:
 
 
 @dataclass
+class MoELoadBalanceConfig:
+    """train.moe_load_balance.* — MoE load-balancing mode and diagnostics."""
+
+    mode: Literal["auto", "none", "aux_loss", "aux_free"] = field(
+        default="auto",
+        metadata={
+            "help": (
+                "MoE load-balancing mode. 'auto' preserves model defaults; "
+                "'none' disables load balancing; 'aux_loss' uses a model-provided router auxiliary loss; "
+                "'aux_free' updates expert-wise routing bias without gradients."
+            )
+        },
+    )
+    monitor_interval: int = field(
+        default=0,
+        metadata={
+            "help": (
+                "Aggregate and log MoE expert-load metrics every N steps. 0 disables metric logging. "
+                "The legacy train.moe_load_balance_monitor_interval field is mapped here when set."
+            )
+        },
+    )
+    log_to_console: bool = field(
+        default=True,
+        metadata={"help": "Log MoE load-balance summary metrics to the rank-0 console."},
+    )
+    aux_loss_coef: Optional[float] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Router auxiliary loss coefficient for mode='aux_loss'. If set, it overrides "
+                "model.config.router_aux_loss_coef or model.config.text_config.router_aux_loss_coef."
+            )
+        },
+    )
+    aux_free_bias_update_rate: float = field(
+        default=1.0e-3,
+        metadata={
+            "help": (
+                "Auxiliary-loss-free bias update rate gamma. At each update, overloaded experts "
+                "decrease their routing bias by gamma and underloaded experts increase it by gamma."
+            )
+        },
+    )
+    aux_free_update_interval: int = field(
+        default=1,
+        metadata={"help": "Update aux-free expert-wise routing bias every N steps when mode='aux_free'."},
+    )
+
+
+@dataclass
 class TrainingArguments:
     """train.* — Top-level training configuration."""
 
@@ -547,14 +598,14 @@ class TrainingArguments:
         default=0,
         metadata={
             "help": (
-                "Log MoE expert load heatmap every N steps. 0 = disabled. Counts are "
-                "all-reduced across EP and DP groups so the heatmap is global. "
-                "Wandb logging is performed only when train.wandb.enable=True."
+                "Deprecated alias for train.moe_load_balance.monitor_interval. "
+                "Log MoE expert load heatmap every N steps. 0 = disabled."
             )
         },
     )
 
     # sub-argument groups
+    moe_load_balance: MoELoadBalanceConfig = field(default_factory=MoELoadBalanceConfig)
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
     wandb: WandbConfig = field(default_factory=WandbConfig)
     profile: ProfileConfig = field(default_factory=ProfileConfig)
@@ -567,6 +618,9 @@ class TrainingArguments:
         self.local_rank = int(os.getenv("LOCAL_RANK", 0))
         self.global_rank = int(os.getenv("RANK", 0))
         self.world_size = int(os.getenv("WORLD_SIZE", 1))
+
+        if self.moe_load_balance_monitor_interval > 0 and self.moe_load_balance.monitor_interval == 0:
+            self.moe_load_balance.monitor_interval = self.moe_load_balance_monitor_interval
 
         self._validate_accelerator()
         self._derive_batch_config()

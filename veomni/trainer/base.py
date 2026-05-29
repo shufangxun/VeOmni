@@ -27,6 +27,7 @@ Features:
 """
 
 import json
+import time
 import warnings
 from abc import ABC
 from collections import defaultdict
@@ -154,6 +155,7 @@ class BaseTrainer(Stateful, ABC):
     environ_meter: helper.EnvironMeter  # see in trace_callback.EnvironMeterCallback
     step_env_metrics: Dict[str, Any]  # mfu, flops, tokens, etc
     step_train_metrics: Dict[str, Any]  # loss, grad_norm, lr, etc
+    step_data_fetch_time: float
 
     # Checkpointer
     checkpointer: CheckpointerBase  # see in checkpoint_callback.CheckpointerCallback
@@ -179,6 +181,8 @@ class BaseTrainer(Stateful, ABC):
         """
 
         self.args: VeOmniArguments = args
+        self.step_data_fetch_time = 0.0
+        self._step_data_fetch_start_time = None
         self._setup()
         # build model
         self._build_model()
@@ -578,10 +582,27 @@ class BaseTrainer(Stateful, ABC):
         return loss, loss_dict
 
     def _use_router_aux_loss(self, router_aux_loss_coef: float | None) -> bool:
+        mode = getattr(getattr(getattr(self, "args", None), "train", None), "moe_load_balance", None)
+        mode = getattr(mode, "mode", "auto")
+        if mode in ("none", "aux_free"):
+            return False
         return router_aux_loss_coef is not None
 
     def _get_router_aux_loss_coef(self) -> float | None:
         """Return the router auxiliary loss coefficient for dense or wrapped MoE configs."""
+        lb_config = getattr(getattr(getattr(self, "args", None), "train", None), "moe_load_balance", None)
+        if lb_config is None:
+            lb_mode = "auto"
+            lb_aux_loss_coef = None
+        else:
+            lb_mode = lb_config.mode
+            lb_aux_loss_coef = lb_config.aux_loss_coef
+        if lb_mode == "none":
+            return None
+        if lb_mode == "aux_free":
+            return None
+        if lb_aux_loss_coef is not None:
+            return float(lb_aux_loss_coef)
         for config in (self.model_config, getattr(self.model_config, "text_config", None)):
             if config is None:
                 continue
@@ -639,6 +660,25 @@ class BaseTrainer(Stateful, ABC):
             elif micro_step == num_micro_steps - 1:
                 self.model.set_requires_all_reduce(True)
 
+    def _start_data_fetch_timer(self) -> None:
+        self._step_data_fetch_start_time = time.perf_counter()
+        self.step_data_fetch_time = 0.0
+
+    def _stop_data_fetch_timer(self) -> None:
+        if self._step_data_fetch_start_time is None:
+            self.step_data_fetch_time = 0.0
+            return
+
+        self.step_data_fetch_time = time.perf_counter() - self._step_data_fetch_start_time
+        self._step_data_fetch_start_time = None
+
+    def _next_train_micro_batches(self, data_iterator: Any) -> List[Dict[str, Any]]:
+        self._start_data_fetch_timer()
+        try:
+            return next(data_iterator)
+        finally:
+            self._stop_data_fetch_timer()
+
     def train_step(
         self,
         data_iterator: Any,
@@ -646,7 +686,7 @@ class BaseTrainer(Stateful, ABC):
         args = self.args
         self.state.global_step += 1
 
-        micro_batches: List[Dict[str, Any]] = next(data_iterator)
+        micro_batches: List[Dict[str, Any]] = self._next_train_micro_batches(data_iterator)
 
         self.on_step_begin(micro_batches=micro_batches)
 

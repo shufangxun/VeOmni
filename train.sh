@@ -5,6 +5,7 @@ set -o pipefail
 
 export TOKENIZERS_PARALLELISM=false
 export TORCH_NCCL_AVOID_RECORD_STREAMS=1
+export PYTHONPATH="$(pwd):${PYTHONPATH:-}"
 
 NNODES=${NNODES:=1}
 if command -v nvidia-smi &> /dev/null && nvidia-smi --list-gpus &> /dev/null; then
@@ -36,7 +37,7 @@ else
   additional_args="--rdzv_endpoint=${MASTER_ADDR}:${MASTER_PORT}"
 fi
 
-torchrun \
+python -m torch.distributed.run \
   --nnodes=$NNODES \
   --nproc-per-node=$NPROC_PER_NODE \
   --node-rank=$NODE_RANK \

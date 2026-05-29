@@ -44,14 +44,22 @@ class MoERouterMonitorCallback(Callback):
         self.monitor = None
 
         args: "VeOmniArguments" = self.trainer.args
-        if args.train.moe_load_balance_monitor_interval <= 0:
-            logger.info_rank0("MoE router monitor disabled (moe_load_balance_monitor_interval=0).")
+        lb_config = args.train.moe_load_balance
+        self.monitor_interval = lb_config.monitor_interval
+        self.aux_free_update_interval = lb_config.aux_free_update_interval if lb_config.mode == "aux_free" else 0
+        self.active_interval = min(
+            interval for interval in (self.monitor_interval, self.aux_free_update_interval) if interval > 0
+        ) if self.monitor_interval > 0 or self.aux_free_update_interval > 0 else 0
+
+        if self.active_interval <= 0:
+            logger.info_rank0("MoE router monitor disabled (moe_load_balance.monitor_interval=0).")
             return
 
         config = self.trainer.model_config
-        if not hasattr(config, "num_experts"):
+        num_experts = self._get_num_experts(config)
+        if num_experts is None:
             logger.warning_rank0(
-                "moe_load_balance_monitor_interval > 0 but model config has no 'num_experts'. "
+                "MoE load-balance monitoring requested but model config has no num_experts or n_routed_experts. "
                 "MoE router monitor not activated."
             )
             return
@@ -60,14 +68,27 @@ class MoERouterMonitorCallback(Callback):
 
         # Process groups are read lazily in on_train_begin once the device
         # mesh is guaranteed to be initialized.
-        self.monitor = MoERouterMonitor(num_experts=config.num_experts)
+        self.monitor = MoERouterMonitor(num_experts=num_experts)
         set_active_monitor(self.monitor)
         ps = get_parallel_state()
         logger.info_rank0(
-            f"MoE router monitor created: num_experts={config.num_experts}, "
-            f"interval={args.train.moe_load_balance_monitor_interval}, "
+            f"MoE router monitor created: num_experts={num_experts}, "
+            f"monitor_interval={self.monitor_interval}, "
+            f"aux_free_update_interval={self.aux_free_update_interval}, "
+            f"mode={lb_config.mode}, "
             f"ep_size={ps.ep_size if ps.ep_enabled else 1}"
         )
+
+    @staticmethod
+    def _get_num_experts(config) -> int | None:
+        for candidate in (config, getattr(config, "text_config", None)):
+            if candidate is None:
+                continue
+            for attr in ("num_experts", "n_routed_experts"):
+                value = getattr(candidate, attr, None)
+                if value is not None:
+                    return int(value)
+        return None
 
     def on_train_begin(self, state: TrainerState, **kwargs) -> None:
         if self.monitor is None:
@@ -95,34 +116,74 @@ class MoERouterMonitorCallback(Callback):
 
     def on_step_end(self, state: TrainerState, **kwargs) -> None:
         args: "VeOmniArguments" = self.trainer.args
-        if self.monitor is None or state.global_step % args.train.moe_load_balance_monitor_interval != 0:
+        if self.monitor is None or state.global_step % self.active_interval != 0:
             return
 
-        # compute_metrics runs an all-reduce across EP/DP groups, so every rank
-        # must call it — but only rank 0 logs.
-        metrics = self.monitor.compute_metrics(current_step=state.global_step)
-        if not metrics or args.train.global_rank != 0 or not args.train.wandb.enable:
-            return
+        lb_config = args.train.moe_load_balance
+        # get_count_matrix runs an all-reduce across DP/SP groups, so every rank
+        # must call it. Formatting and logging remain rank-0 only.
+        count_matrix = self.monitor.get_count_matrix(current_step=state.global_step, reset=True)
 
-        import wandb
-
-        wandb_metrics = {}
-        for k, v in metrics.items():
-            if k.endswith("expert_load_heatmap"):
-                start, end = self.monitor._last_step_range
-                wandb_metrics[k] = wandb.Image(v, caption=f"Steps {start}-{end}")
-            else:
-                wandb_metrics[k] = v
-        wandb.log(wandb_metrics, step=state.global_step)
-
-        start, end = self.monitor._last_step_range
-        logger.info_rank0(
-            f"Step {state.global_step}: uploaded MoE load balance heatmap "
-            f"(steps {start}-{end}), "
-            f"max_vio max={metrics['moe/max_vio/max']:.4f} avg={metrics['moe/max_vio/avg']:.4f}, "
-            f"min_vio max={metrics['moe/min_vio/max']:.4f} avg={metrics['moe/min_vio/avg']:.4f}, "
-            f"avg_vio max={metrics['moe/avg_vio/max']:.4f} avg={metrics['moe/avg_vio/avg']:.4f}."
+        should_update = (
+            lb_config.mode == "aux_free"
+            and self.aux_free_update_interval > 0
+            and state.global_step % self.aux_free_update_interval == 0
         )
+        update_metrics = {}
+        if should_update:
+            update_metrics = self.monitor.update_aux_free_bias(
+                count_matrix=count_matrix,
+                update_rate=lb_config.aux_free_bias_update_rate,
+            )
+
+        should_log = self.monitor_interval > 0 and state.global_step % self.monitor_interval == 0
+        metrics = (
+            self.monitor.compute_metrics_from_counts(count_matrix=count_matrix, format_only_on=args.train.global_rank == 0)
+            if should_log
+            else {}
+        )
+        if args.train.global_rank != 0:
+            return
+
+        metrics.update(update_metrics)
+        if not metrics:
+            return
+
+        if lb_config.log_to_console:
+            self._log_console_summary(state.global_step, metrics)
+
+        if args.train.wandb.enable:
+            import wandb
+
+            wandb_metrics = {}
+            for k, v in metrics.items():
+                if k.endswith("expert_load_heatmap"):
+                    start, end = self.monitor._last_step_range
+                    wandb_metrics[k] = wandb.Image(v, caption=f"Steps {start}-{end}")
+                else:
+                    wandb_metrics[k] = v
+            wandb.log(wandb_metrics, step=state.global_step)
+
+    def _log_console_summary(self, global_step: int, metrics: Dict[str, Any]) -> None:
+        start, end = self.monitor._last_step_range
+        parts = [
+            f"Step {global_step}: MoE load balance (steps {start}-{end})",
+            f"max_vio max={metrics.get('moe/max_vio/max', 0.0):.4f}",
+            f"max_vio avg={metrics.get('moe/max_vio/avg', 0.0):.4f}",
+            f"avg_vio max={metrics.get('moe/avg_vio/max', 0.0):.4f}",
+            f"avg_vio avg={metrics.get('moe/avg_vio/avg', 0.0):.4f}",
+            # f"min_vio max={metrics.get('moe/min_vio/max', 0.0):.4f}",
+            # f"min_vio avg={metrics.get('moe/min_vio/avg', 0.0):.4f}",
+        ]
+        if "aux_free_bias/updated_layers" in metrics:
+            parts.extend(
+                [
+                    f"aux_free updated_layers={metrics['aux_free_bias/updated_layers']:.0f}",
+                    f"gamma={metrics['aux_free_bias/update_rate']:.2e}",
+                    f"max_abs_bias={metrics['aux_free_bias/max_abs_bias']:.4f}",
+                ]
+            )
+        logger.info_rank0(", ".join(parts) + ".")
 
     def on_train_end(self, state: TrainerState, **kwargs) -> None:
         if self.monitor is not None:
@@ -209,6 +270,22 @@ class EnvironMeterCallback(Callback):
     ) -> None:
         delta_time = time.time() - self.start_time
         step_env_metrics = self.trainer.environ_meter.step(delta_time, global_step=state.global_step)
+        data_fetch_time = getattr(self.trainer, "step_data_fetch_time", 0.0)
+        train_compute_time = delta_time
+        step_wall_time = data_fetch_time + train_compute_time
+        data_fetch_ratio = data_fetch_time / step_wall_time if step_wall_time else 0.0
+        data_fetch_time, train_compute_time, step_wall_time, data_fetch_ratio = all_reduce(
+            [data_fetch_time, train_compute_time, step_wall_time, data_fetch_ratio],
+            op="max",
+        )
+        step_env_metrics.update(
+            {
+                "perf/data_fetch_time_max_s": data_fetch_time,
+                "perf/train_compute_time_max_s": train_compute_time,
+                "perf/step_wall_time_max_s": step_wall_time,
+                "perf/data_fetch_ratio_max": data_fetch_ratio,
+            }
+        )
 
         step_train_metrics = {
             "total_loss": loss,

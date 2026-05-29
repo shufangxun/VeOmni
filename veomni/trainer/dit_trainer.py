@@ -473,20 +473,24 @@ class DiTTrainer:
 
         # broadcast micro_batches from sp_rank_0 to all ranks
         if get_parallel_state().sp_enabled:
-            if get_parallel_state().sp_rank == 0:
-                micro_batches = next(data_iterator)
-            else:
-                micro_batches = None
+            self.base._start_data_fetch_timer()
+            try:
+                if get_parallel_state().sp_rank == 0:
+                    micro_batches = next(data_iterator)
+                else:
+                    micro_batches = None
 
-            obj_list = [micro_batches]
-            dist.broadcast_object_list(
-                obj_list,
-                src=dist.get_global_rank(get_parallel_state().sp_group, 0),
-                group=get_parallel_state().sp_group,
-            )
-            micro_batches = obj_list[0]
+                obj_list = [micro_batches]
+                dist.broadcast_object_list(
+                    obj_list,
+                    src=dist.get_global_rank(get_parallel_state().sp_group, 0),
+                    group=get_parallel_state().sp_group,
+                )
+                micro_batches = obj_list[0]
+            finally:
+                self.base._stop_data_fetch_timer()
         else:
-            micro_batches = next(data_iterator)
+            micro_batches = self.base._next_train_micro_batches(data_iterator)
 
         self.on_step_begin(micro_batches=micro_batches)
 

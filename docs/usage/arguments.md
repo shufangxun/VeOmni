@@ -229,7 +229,8 @@ NPU validation runs at two times:
 | seed | `int` | `42` | Random seed. |
 | enable_compile | `bool` | `False` | Enable `torch.compile`. |
 | max_steps | `Optional[int]` | `None` | Max training steps per epoch (debug only). |
-| moe_load_balance_monitor_interval | `int` | `0` | Aggregate MoE expert-load heatmaps and violation metrics every N steps. `0` disables it. W&B is required only for logging. |
+| moe_load_balance | `MoELoadBalanceConfig` | — | MoE load-balance mode and diagnostics. `mode` is `auto`, `none`, `aux_loss`, or `aux_free`; `aux_free_bias_update_rate` is the loss-free bias update speed gamma. |
+| moe_load_balance_monitor_interval | `int` | `0` | Deprecated alias for `moe_load_balance.monitor_interval`. |
 | optimizer | `OptimizerConfig` | — | Optimizer and learning-rate schedule. |
 | wandb | `WandbConfig` | — | Weights & Biases logging. |
 | profile | `ProfileConfig` | — | Torch profiler settings. |

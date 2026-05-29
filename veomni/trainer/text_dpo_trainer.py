@@ -334,7 +334,7 @@ class TextDPOTrainer:
         args: VeOmniDPOArguments = self.base.args
         self.base.state.global_step += 1
 
-        micro_batches: List[Dict[str, Any]] = next(data_iterator)
+        micro_batches: List[Dict[str, Any]] = self.base._next_train_micro_batches(data_iterator)
 
         self.on_step_begin(micro_batches=micro_batches)
 

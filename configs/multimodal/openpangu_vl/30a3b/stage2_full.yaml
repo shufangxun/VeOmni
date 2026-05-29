@@ -1,27 +1,27 @@
 model:
-  config_path: /root/shufangxun/Verl-Pangu30B/models/pangu30b_vl_clean
-  model_path: null
-  tokenizer_path: /root/shufangxun/Verl-Pangu30B/models/pangu30b_vl_clean
+  config_path: /root/public/jasonshu/models/pangu30b_vl_clean
+  model_path: /root/public/jasonshu/models/pangu30b_vl_clean
+  tokenizer_path: /root/public/jasonshu/models/pangu30b_vl_clean
   ops_implementation:
     attn_implementation: flash_attention_2
     moe_implementation: fused_triton
     cross_entropy_loss_implementation: liger_kernel
 
 data:
-  train_path: configs/multimodal/data/qwen3_siglip_stage2_full.yaml
+  train_path: configs/multimodal/data/panguvl_llava_next_stage2_full.yaml
   multisource_datasets_type: veomni_weighted_multisource
   datasets_type: iterable
   data_type: openpangu_vl
   chat_template: openpangu_vl
-  max_seq_len: 512
-  train_size: 100000000
+  max_seq_len: 4096
+  train_size: 470000000
   dataloader:
     type: native
     drop_last: true
     num_workers: 1
   dyn_bsz_buffer_size: 100
   mm_configs:
-    image_max_pixels: 200704
+    image_max_pixels: 1048576
     image_min_pixels: 3136
     max_ratio: 200
     video_max_pixels: 200704
@@ -33,7 +33,7 @@ data:
 train:
   accelerator:
     ulysses_size: 1
-    ep_size: 2
+    ep_size: 4
     fsdp_config:
       fsdp_mode: fsdp2
       full_shard: true
@@ -45,20 +45,23 @@ train:
   gradient_checkpointing:
     enable: true
     enable_reentrant: false
-  global_batch_size: 4
+  global_batch_size: 8
   micro_batch_size: 1
   dyn_bsz_runtime: worker
   log_train_source_loss_steps: 5
   log_train_domain_loss_steps: 5
-  moe_load_balance_monitor_interval: 1
+  moe_load_balance:
+    mode: aux_free
+    monitor_interval: 1
+    log_to_console: true
+    aux_free_bias_update_rate: 1.0e-3
+    aux_free_update_interval: 1
   bsz_warmup_ratio: 0.01
   optimizer:
     type: adamw
-    lr: 3.0e-4
-    lr_warmup_ratio: 0.0001
+    lr: 5.0e-6
+    lr_warmup_ratio: 0.02
     lr_decay_style: cosine
-    weight_decay: 0.01
-    max_grad_norm: 1.0
   freeze_vit: false
   freeze_connector: false
   freeze_llm: false
@@ -71,6 +74,6 @@ train:
     save_steps: 0
     save_hf_weights: false
   wandb:
-    enable: false
+    enable: true
     project: openpangu-vl-30a3b
     name: openpangu-vl-30a3b-sft
